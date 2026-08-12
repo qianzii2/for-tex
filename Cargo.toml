@@ -1,0 +1,24 @@
+[package]
+name = "for-tex"
+version = "0.1.0"
+edition = "2021"
+description = "ForTeX: Fortran-powered Tensor Execution Engine — LTO-enabled"
+
+[lib]
+name = "for_tex"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.23", features = ["extension-module"] }
+numpy = "0.23"
+rayon = "1.10"
+
+[build-dependencies]
+num_cpus = "1"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+opt-level = 3
+panic = "abort"
+strip = "symbols"
