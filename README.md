@@ -4,7 +4,7 @@
 目标是把常见 ML 算子跑到和 PyTorch (MKL/oneDNN) 同一个量级 —— 部分算子更快。
 
 > 目前覆盖 GEMM / Conv2D / Softmax / LayerNorm / GELU / Fused Linear+ReLU。
-> 7 个算子中 **3 个稳定超越 PyTorch**，2 个打到 PyTorch 的 80% 区间，2 个仍有差距。
+> 7 个算子中 **3 个稳定超越 PyTorch**，2 个打到 PyTorch 的 50% 区间，2 个仍有差距。
 
 ---
 
