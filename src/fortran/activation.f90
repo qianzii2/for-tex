@@ -1,5 +1,5 @@
 !==============================================================================
-! ForTeX Activation Functions — 全部 elemental，编译器自动广播 + 向量化
+! ForTeX Activation Functions — 全部 elemental 向量化
 !==============================================================================
 module activation
     use, intrinsic :: iso_fortran_env, only: real64
@@ -55,7 +55,6 @@ contains
             xv = x(i)
             x_cubed = xv * xv * xv
             inner = SQRT_2_OVER_PI * (xv + 0.044715_real64 * x_cubed)
-            ! Padé 9阶近似 tanh（|inner|<9 范围内）
             tnh = tanh_pade(inner)
             y(i) = 0.5_real64 * xv * (1.0_real64 + tnh)
         end do

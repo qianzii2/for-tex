@@ -33,12 +33,13 @@ fn main() {
     // --- Dependency-ordered source list ---
     //   avx512_math 必须第一！其他模块 use 它
     let sources: Vec<&str> = vec![
-        "avx512_math.f90",  // ★ Round-16: 手写 AVX-512 exp/log kernel (must be first!)
+        "avx512_math.f90",  // ★ 必须第一！其他模块 use 它
         "blas.f90",
         "activation.f90",
         "loss.f90",
         "norm.f90",
         "conv.f90",
+        "scipy_openblas.f90",  // ★ scipy OpenBLAS wrapper
         "c_bridge.f90",
     ];
 
@@ -73,18 +74,16 @@ fn main() {
 
     let mut cmd = Command::new(&gfortran);
     cmd.args(["-shared"]);           // Win→DLL, Linux→.so, mac→.dylib
-    cmd.args(["-O3", "-fPIC"]);
+    cmd.args(["-Ofast", "-fPIC"]);
     // Linux/macOS: 让共享库自报 SONAME，运行时 dlopen 用 lib 名查找
     #[cfg(not(target_os = "windows"))]
     cmd.args([format!("-Wl,-soname,{}", lib_filename).as_str()]);
-    cmd.args(["-ffast-math", "-funroll-loops", "-ftree-vectorize"]);
-    // ★ 允许编译器重排数学运算 + 让 exp/log 向量化 (SIMD)
-    cmd.args(["-fno-math-errno", "-fno-trapping-math", "-funsafe-math-optimizations"]);
+    cmd.args(["-funroll-loops", "-ftree-vectorize"]);
     // ★ 通用可移植指令集：x86-64-v3 (Haswell 2013+)
     //   包含 AVX2 + FMA + BMI2，几乎所有 2015 年后的 x86 CPU 都支持。
     //   编译时无需写手写 intrinsics，让 gfortran 自动生成 SIMD FMA 代码。
     //   不用 -march=native，因为那会让二进制无法在其他机器跑。
-    cmd.args(["-march=x86-64-v4", "-mtune=generic"]);  // ★ Round-16: AVX-512 (512-bit SIMD, 8-wide f64)
+    cmd.args(["-march=x86-64-v3", "-mtune=generic"]);  // ★ AVX2 + FMA (Haswell+, safe portable)
     cmd.args(["-std=f2018"]);
     // ★ Round-18: 显式 free-form（避免 gfortran 误判 fixed-form 抑制 sentinel OMP 指令）
     cmd.args(["-ffree-form"]);
@@ -116,8 +115,29 @@ fn main() {
         "-Wl,--enable-auto-import",
     ]);
 
-    cmd.args([
-        "-J", out_dir.to_str().unwrap(),
+    // === Copy OpenBLAS DLL before linking ===
+    #[cfg(target_os = "windows")]
+    {
+        let scipy_libs = std::path::Path::new(
+            &env::var("VIRTUAL_ENV").unwrap_or_else(|_| ".venv".to_string())
+        ).join("Lib").join("site-packages").join("scipy.libs");
+        if scipy_libs.exists() {
+            for entry in std::fs::read_dir(&scipy_libs).unwrap() {
+                let path = entry.unwrap().path();
+                if path.extension().map_or(false, |e| e == "dll") {
+                    let dest = out_dir.join("openblas.dll");
+                    std::fs::copy(&path, &dest).ok();
+                    println!("cargo:warning=OpenBLAS DLL copied: {}", dest.display());
+                    break;
+                }
+            }
+        }
+    }
+
+    cmd.args(["-J", out_dir.to_str().unwrap(),
+        "-L", out_dir.to_str().unwrap(),
+        "-l:openblas.dll",                  // ★ 直接链接 DLL（MinGW）
+        "-Wl,--enable-auto-import",         // ★ 允许自动导入
         "-o", lib_path.to_str().unwrap(),
         combined_path.to_str().unwrap(),
     ]);
@@ -152,8 +172,10 @@ fn main() {
     println!("cargo:rustc-link-search=native={}", out_dir.display());
     println!("cargo:rustc-link-lib={}", link_kind); // win: fortran_core.lib; unix: dylib=fortran_core.so
 
+    println!("cargo:rustc-link-lib=openblas");
+
     // ★ Round-16: LLVM AVX-512 SIMD (512-bit, 8-wide f64)
-    println!("cargo:rustc-env=RUSTFLAGS=-C target-cpu=x86-64-v4");
+    println!("cargo:rustc-env=RUSTFLAGS=-C target-cpu=x86-64-v3");
 
     // ★★★ Linux 云端：链接 OpenBLAS + 设置 NUMA 亲和性 ★★★
     // OpenBLAS 会自动选择 per-CPU 最优 GEMM kernel（SKX/ZN 4 等）

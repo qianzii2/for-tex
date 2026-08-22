@@ -1,188 +1,438 @@
 """
-ForTeX vs PyTorch vs NumPy Benchmark
-=====================================
-比较 GEMM、Conv2D、Softmax、LayerNorm 的纯计算性能
+ForTeX vs PyTorch Benchmark — 业界标准微基准测试
+==================================================
+
+设计参考：
+  - Google Benchmark (C++): 自动校准, min 作为性能指标, 多 repetition
+  - torch.utils.benchmark.Timer: blocked_autorange, min/median 报告
+  - pytest-benchmark: IQR 离群值检测, 统计报告
+  - asv (airspeed-velocity): 峰值性能检测, 多次 warmup
+
+核心原则：
+  1. min 作为"无干扰峰值性能"（排除 OS 调度/中断噪声）
+  2. 自动校准迭代次数（确保每次 trial 足够长，减少 timer 精度影响）
+  3. IQR 离群值检测（仅剔除真正的离群值，不无条件截断）
+  4. PyTorch 对比零额外开销（无 .numpy() 转换，数据预转置）
+  5. 正确性验证前置（smoke test 必须先通过）
 """
 import os
+import sys
 import time
+import platform
 import numpy as np
-import torch
-import for_tex
 
-# ★ Round-15: OMP 线程亲和性 — 必须在这里设置，不能在 .venv 内设置
-#   OMP_PROC_BIND=close: 让每个线程绑定到相邻核心，减少 cache bouncing
-#   OMP_PLACES=cores: 每个核心一个 place
+# ── 环境变量必须在 import for_tex 之前设置 ──────────────────────────
 os.environ.setdefault("OMP_PROC_BIND", "close")
 os.environ.setdefault("OMP_PLACES", "cores")
 
-# 线程数 & 绑核：自动检测本机逻辑核心数；让 OMP / PyTorch / NumPy 全部用同一配置
 NTHREADS = int(os.environ.get("FORTEX_THREADS", os.cpu_count() or 8))
-torch.set_num_threads(NTHREADS)
 os.environ.setdefault("OMP_NUM_THREADS", str(NTHREADS))
-os.environ.setdefault("OMP_PROC_BIND", "true")
-os.environ.setdefault("OMP_PLACES", "cores")
 os.environ.setdefault("MKL_NUM_THREADS", str(NTHREADS))
-print(f"[env] NTHREADS={NTHREADS} (override via FORTEX_THREADS env)")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", str(NTHREADS))
 
-def bench(name, fn, warmup=20, iters=200, trials=3):
-    """运行 benchmark，返回中位耗时 (ms) — 多次 trial 取最稳定"""
+import for_tex
+import torch
+
+torch.set_num_threads(NTHREADS)
+torch.set_grad_enabled(False)  # 纯推理模式，零 autograd 开销
+
+# ── 正确性验证前置 ──────────────────────────────────────────────────
+from test_smoke import run_all_tests
+
+print("=" * 72)
+print("  ForTeX Benchmark — Fair Comparison with PyTorch")
+print("=" * 72)
+print()
+print("--- Correctness Check (smoke test) ---")
+failures = run_all_tests()
+if failures > 0:
+    print(f"\n[ABORT] {failures} correctness test(s) failed. Benchmark refused.")
+    sys.exit(1)
+print("\n[OK] All correctness tests passed. Proceeding to benchmark.\n")
+
+
+# ============================================================================
+# Benchmark 核心函数
+# ============================================================================
+
+def auto_calibrate(fn, target_time=0.5, min_iters=10, max_iters=500):
+    """
+    自动校准迭代次数，使每次 trial 总耗时 >= target_time 秒。
+    参考 torch.utils.benchmark.Timer.blocked_autorange()。
+    """
+    n_probe = min(min_iters, 10)
+    times = []
+    for _ in range(n_probe):
+        t0 = time.perf_counter()
+        fn()
+        times.append(time.perf_counter() - t0)
+    avg = sum(times) / len(times)
+    if avg * min_iters >= target_time:
+        return min_iters
+    iters = int(target_time / avg)
+    return max(min(iters, max_iters), min_iters)
+
+
+def bench(fn, warmup=10, trials=7, target_time=0.5):
+    """
+    严谨的微基准测试。
+
+    流程：
+      1. 预热 (warmup) — JIT 编译、cache 预热
+      2. 自动校准迭代次数
+      3. trials 次独立 trial，每次取 min（Google Benchmark 标准）
+      4. IQR 离群值检测 — 仅剔除受 OS 严重干扰的 trial
+      5. 报告 min/median/mean±std
+
+    返回: dict {'min','median','mean','std','n_trials','n_iters','unit'}
+    """
     for _ in range(warmup):
         fn()
-    trial_means = []
+
+    iters = auto_calibrate(fn, target_time)
+
+    trial_mins = []
     for _ in range(trials):
         times = []
         for _ in range(iters):
             t0 = time.perf_counter()
             fn()
-            times.append((time.perf_counter() - t0) * 1000)
-        times = np.asarray(times)
-        # 去掉最高的 20% 离群点（OS 抖动 / 上下文切换）
-        keep = times < np.percentile(times, 80)
-        trial_means.append(float(np.mean(times[keep])))
-    trial_means = np.asarray(trial_means)
-    # 取最快的 trial 中位数（最稳定的"能力上限"）
-    best_trial = float(np.min(trial_means))
-    median_trial = float(np.median(trial_means))
-    print(f"  {name:<20s} {median_trial:8.3f} ms (best-of-{trials} {best_trial:.3f})")
-    return median_trial
+            times.append(time.perf_counter() - t0)
+        trial_mins.append(min(times))  # ★ 每次 trial 取 min
 
-def compare(title, fortex_ms, torch_ms, numpy_ms=None):
-    print(f"\n  【{title}】")
-    if numpy_ms is not None:
-        print(f"  NumPy   : {numpy_ms:8.3f} ms")
-    print(f"  ForTeX  : {fortex_ms:8.3f} ms")
-    print(f"  PyTorch : {torch_ms:8.3f} ms")
-    speedup = torch_ms / fortex_ms
-    label = "🚀 FASTER" if speedup > 1.01 else ("⚖️  TIE" if speedup > 0.99 else "🐢 slower")
-    print(f"  ForTeX vs PyTorch: {speedup:.2f}x {label}")
+    trial_mins = np.array(trial_mins) * 1000.0
 
-torch.set_num_threads(NTHREADS)
+    # IQR 离群值检测（仅当有足够方差时）
+    if len(trial_mins) >= 5 and np.std(trial_mins) > 0:
+        q1, q3 = np.percentile(trial_mins, 25), np.percentile(trial_mins, 75)
+        iqr = q3 - q1
+        lower = q1 - 1.5 * iqr
+        upper = q3 + 1.5 * iqr
+        clean = trial_mins[(trial_mins >= lower) & (trial_mins <= upper)]
+        if len(clean) >= 3:
+            trial_mins = clean
 
-print("=" * 64)
-print("  ForTeX Benchmark")
-print("=" * 64)
+    return {
+        'min': float(np.min(trial_mins)),
+        'median': float(np.median(trial_mins)),
+        'mean': float(np.mean(trial_mins)),
+        'std': float(np.std(trial_mins)),
+        'n_trials': len(trial_mins),
+        'n_iters': iters,
+        'unit': 'ms',
+    }
 
-# ========== 1. GEMM (DGEMM) ==========
-print("\n--- 1. GEMM (矩阵乘法) ---")
 
-# 小矩阵
-m, n, k = 256, 256, 256
-a = np.random.randn(m, k)
-b = np.random.randn(k, n)
-a_t = torch.tensor(a)
-b_t = torch.tensor(b)
+def speedup(ft_result, pt_result):
+    """Speedup = PyTorch_min / ForTeX_min。> 1.0 表示 ForTeX 更快。"""
+    return pt_result['min'] / ft_result['min']
 
-ft_ms = bench("ForTeX gemm", lambda: for_tex.gemm(a, b), iters=200)
-th_ms = bench("PyTorch matmul", lambda: torch.matmul(a_t, b_t), iters=200)
-np_ms = bench("NumPy matmul", lambda: a @ b, iters=200)
-compare("GEMM 256x256x256", ft_ms, th_ms, np_ms)
 
-# 中型矩阵
-m, n, k = 1024, 1024, 1024
-a = np.random.randn(m, k)
-b = np.random.randn(k, n)
-a_t = torch.tensor(a)
-b_t = torch.tensor(b)
+def verdict(sp, tight=False):
+    """将 speedup 转为人类可读标签。"""
+    t = 1.02 if tight else 1.05
+    if sp > t:
+        return "WIN"
+    elif sp < 1.0 / t:
+        return "LOSS"
+    else:
+        return "TIE"
 
-ft_ms = bench("ForTeX gemm", lambda: for_tex.gemm(a, b), iters=50)
-th_ms = bench("PyTorch matmul", lambda: torch.matmul(a_t, b_t), iters=50)
-np_ms = bench("NumPy matmul", lambda: a @ b, iters=50)
-compare("GEMM 1024x1024x1024", ft_ms, th_ms, np_ms)
 
-# ========== 2. Simple GEMM (matmul) ==========
-print("\n--- 2. Simple GEMM (Fortran matmul) ---")
+# ============================================================================
+# 格式化输出
+# ============================================================================
 
-m, n, k = 512, 512, 512
-a = np.random.randn(m, k)
-b = np.random.randn(k, n)
-a_t = torch.tensor(a)
-b_t = torch.tensor(b)
+def print_header():
+    cpu_name = platform.processor() or "Unknown"
+    print(f"System:      {platform.system()} {platform.release()} | {os.cpu_count()} logical cores")
+    print(f"CPU:         {cpu_name}")
+    print(f"Python:      {platform.python_version()}")
+    print(f"PyTorch:     {torch.__version__}")
+    print(f"ForTeX:      {for_tex.__version__}")
+    print(f"Threads:     {NTHREADS} (OMP_PROC_BIND=close, OMP_PLACES=cores)")
+    print(f"Precision:   float64")
 
-ft_ms = bench("ForTeX simple_gemm", lambda: for_tex.simple_gemm(a, b), iters=100)
-th_ms = bench("PyTorch matmul", lambda: torch.matmul(a_t, b_t), iters=100)
-np_ms = bench("NumPy matmul", lambda: a @ b, iters=100)
-compare("Simple GEMM 512x512x512", ft_ms, th_ms, np_ms)
 
-# ========== 3. Fused Linear+ReLU ==========
-print("\n--- 3. Fused Linear+ReLU (算子融合) ---")
+def fmt_time(ms):
+    if ms < 0.001:
+        return f"{ms*1e6:.1f}ns"
+    elif ms < 1.0:
+        return f"{ms*1e3:.1f}us"
+    elif ms < 1000:
+        return f"{ms:.2f}ms"
+    else:
+        return f"{ms/1000:.2f}s"
 
-m, n, k = 512, 1024, 512
-weight = np.random.randn(m, k)
-bias = np.random.randn(m)
-x = np.random.randn(k, n)
-w_t = torch.tensor(weight)
-b_t = torch.tensor(bias)
-x_t = torch.tensor(x)
 
-ft_ms = bench("ForTeX fused", lambda: for_tex.linear_relu(weight, bias, x), iters=100)
-th_ms = bench("PyTorch F.linear+relu", lambda: torch.relu(torch.nn.functional.linear(x_t.T, w_t, b_t)).T.numpy(), iters=100)
-compare("Fused Linear+ReLU", ft_ms, th_ms)
+def print_table(title, rows):
+    """打印 benchmark 对比表格。"""
+    print(f"\n{'─'*72}")
+    print(f"  {title}")
+    print(f"{'─'*72}")
+    print(f"  {'':<22s} {'ForTeX':>34s}  {'PyTorch':>34s}  {'Speedup':>8s}  {'Verdict':>8s}")
+    print(f"  {'':<22s} {'min':>10s}  {'median':>10s}  ±{'std':>8s}  {'min':>10s}  {'median':>10s}  ±{'std':>8s}")
+    print(f"  {'─'*22}  {'─'*34}  {'─'*34}  {'─'*8}  {'─'*8}")
+    for row in rows:
+        ft, pt = row['fortex'], row['pytorch']
+        sp = speedup(ft, pt)
+        v = verdict(sp)
+        print(f"  {row['label']:<22s} {fmt_time(ft['min']):>10s}  {fmt_time(ft['median']):>10s}  ±{fmt_time(ft['std']):>8s}  "
+              f"{fmt_time(pt['min']):>10s}  {fmt_time(pt['median']):>10s}  ±{fmt_time(pt['std']):>8s}  "
+              f"{sp:>7.2f}x  {v:>8s}")
 
-# ========== 4. Conv2D ==========
-print("\n--- 4. Conv2D ---")
 
-n, ci, co, h, w = 4, 16, 32, 56, 56
-kh, kw = 3, 3
-img = np.random.randn(n, ci, h, w)
-kernel = np.random.randn(co, ci, kh, kw)
-bias = np.random.randn(co)
-img_t = torch.tensor(img)
-kernel_t = torch.tensor(kernel)
-bias_t = torch.tensor(bias)
+# ============================================================================
+# 各算子 Benchmark
+# ============================================================================
 
-ft_ms = bench("ForTeX conv2d", lambda: for_tex.conv2d(img, kernel, bias, padding=1), iters=20)
-th_ms = bench("PyTorch conv2d", lambda: torch.nn.functional.conv2d(img_t, kernel_t, bias_t, padding=1).numpy(), iters=20)
-compare("Conv2D 16->32 56x56", ft_ms, th_ms)
+def bench_gemm():
+    """GEMM (DGEMM)"""
+    print("\n" + "=" * 72)
+    print("  1. GEMM (DGEMM) — 矩阵乘法")
+    print("=" * 72)
+    print("  ForTeX: K-blocked GEMM (Fortran)")
+    print("  PyTorch: torch.matmul → MKL")
 
-# 小型卷积
-n, ci, co, h, w = 2, 3, 64, 28, 28
-kh, kw = 7, 7
-img = np.random.randn(n, ci, h, w)
-kernel = np.random.randn(co, ci, kh, kw)
-bias = np.random.randn(co)
-img_t = torch.tensor(img)
-kernel_t = torch.tensor(kernel)
-bias_t = torch.tensor(bias)
+    configs = [(256,256,256,"256³"), (512,512,512,"512³"),
+               (1024,1024,1024,"1024³"), (2048,2048,2048,"2048³")]
+    rows = []
+    for m, n, k, label in configs:
+        a = np.random.randn(m, k)
+        b = np.random.randn(k, n)
+        a_t = torch.from_numpy(a)
+        b_t = torch.from_numpy(b)
+        ft = bench(lambda a=a, b=b: for_tex.gemm(a, b))
+        pt = bench(lambda a_t=a_t, b_t=b_t: torch.matmul(a_t, b_t))
+        sp = speedup(ft, pt)
+        print(f"  {label:<8s} ForTeX: {fmt_time(ft['min']):>10s}  |  PyTorch: {fmt_time(pt['min']):>10s}  |  {sp:.2f}x {verdict(sp)}")
+        rows.append({'label': label, 'fortex': ft, 'pytorch': pt})
+    print_table("GEMM Summary", rows)
+    return rows
 
-ft_ms = bench("ForTeX conv2d", lambda: for_tex.conv2d(img, kernel, bias, stride=2, padding=3), iters=20)
-th_ms = bench("PyTorch conv2d", lambda: torch.nn.functional.conv2d(img_t, kernel_t, bias_t, stride=2, padding=3).numpy(), iters=20)
-compare("Conv2D 3->64 28x28 s2", ft_ms, th_ms)
 
-# ========== 5. Softmax ==========
-print("\n--- 5. Softmax ---")
+def bench_simple_gemm():
+    """Simple GEMM"""
+    print("\n" + "=" * 72)
+    print("  2. Simple GEMM (Fortran matmul intrinsic)")
+    print("=" * 72)
+    print("  ForTeX: matmul() → gfortran AVX-512 FMA")
+    print("  PyTorch: torch.matmul → MKL")
 
-batch, dim = 1024, 512
-x = np.random.randn(batch, dim)
-x_t = torch.tensor(x)
+    m, n, k = 512, 512, 512
+    a = np.random.randn(m, k)
+    b = np.random.randn(k, n)
+    a_t = torch.from_numpy(a)
+    b_t = torch.from_numpy(b)
+    ft = bench(lambda a=a, b=b: for_tex.simple_gemm(a, b))
+    pt = bench(lambda a_t=a_t, b_t=b_t: torch.matmul(a_t, b_t))
+    sp = speedup(ft, pt)
+    print(f"  512³     ForTeX: {fmt_time(ft['min']):>10s}  |  PyTorch: {fmt_time(pt['min']):>10s}  |  {sp:.2f}x {verdict(sp)}")
+    rows = [{'label': '512³', 'fortex': ft, 'pytorch': pt}]
+    print_table("Simple GEMM", rows)
+    return rows
 
-ft_ms = bench("ForTeX softmax", lambda: for_tex.softmax_fn(x), iters=100)
-th_ms = bench("PyTorch softmax", lambda: torch.softmax(x_t, dim=-1).numpy(), iters=100)
-compare("Softmax 1024x512", ft_ms, th_ms)
 
-# ========== 6. LayerNorm ==========
-print("\n--- 6. LayerNorm ---")
+def bench_linear_relu():
+    """Fused Linear+ReLU"""
+    print("\n" + "=" * 72)
+    print("  3. Fused Linear+ReLU")
+    print("=" * 72)
+    print("  ForTeX: matmul + bias + ReLU 一次内存遍历")
+    print("  PyTorch: F.linear + relu 两个独立 kernel")
 
-x = np.random.randn(batch, dim)
-gamma = np.ones(dim)
-beta = np.zeros(dim)
-x_t = torch.tensor(x)
-g_t = torch.tensor(gamma)
-b_t = torch.tensor(beta)
+    configs = [(512,1024,512,"512×1024×512"), (1024,4096,1024,"1024×4096×1024")]
+    rows = []
+    for m, n, k, label in configs:
+        weight = np.random.randn(m, k)
+        bias = np.random.randn(m)
+        x = np.random.randn(k, n)
+        x_pt = torch.from_numpy(x.T.copy())  # 预转置，避免 lambda 内 .T 开销
+        w_pt = torch.from_numpy(weight)
+        b_pt = torch.from_numpy(bias)
+        ft = bench(lambda w=weight, b=bias, x=x: for_tex.linear_relu(w, b, x))
+        pt = bench(lambda xp=x_pt, wp=w_pt, bp=b_pt: torch.relu(torch.nn.functional.linear(xp, wp, bp)))
+        sp = speedup(ft, pt)
+        print(f"  {label:<16s} ForTeX: {fmt_time(ft['min']):>10s}  |  PyTorch: {fmt_time(pt['min']):>10s}  |  {sp:.2f}x {verdict(sp)}")
+        rows.append({'label': label, 'fortex': ft, 'pytorch': pt})
+    print_table("Fused Linear+ReLU", rows)
+    return rows
 
-ft_ms = bench("ForTeX layernorm", lambda: for_tex.layernorm(x, gamma, beta), iters=100)
-th_ms = bench("PyTorch layernorm", lambda: torch.nn.functional.layer_norm(x_t, (dim,), g_t, b_t).numpy(), iters=100)
-compare("LayerNorm 1024x512", ft_ms, th_ms)
 
-# ========== 7. GELU ==========
-print("\n--- 7. GELU 激活 ---")
+def bench_conv2d():
+    """Conv2D"""
+    print("\n" + "=" * 72)
+    print("  4. Conv2D")
+    print("=" * 72)
+    print("  ForTeX: 直卷积（4 重循环，零拷贝，编译器 SIMD）")
+    print("  PyTorch: F.conv2d → oneDNN")
 
-x = np.random.randn(2048, 2048)
-x_t = torch.tensor(x)
+    configs = [
+        (4, 16, 32, 56, 56, 3, 3, 1, 1, "16→32 56×56 k3p1"),
+        (2, 3, 64, 28, 28, 7, 7, 2, 3, "3→64 28×28 k7s2p3"),
+        (8, 64, 128, 32, 32, 3, 3, 1, 1, "64→128 32×32 k3p1"),
+    ]
+    rows = []
+    for n, ci, co, h, w, kh, kw, stride, pad, label in configs:
+        img = np.random.randn(n, ci, h, w)
+        kernel = np.random.randn(co, ci, kh, kw)
+        bias = np.random.randn(co)
+        img_t = torch.from_numpy(img)
+        ker_t = torch.from_numpy(kernel)
+        b_t = torch.from_numpy(bias)
+        ft = bench(lambda img=img, k=kernel, b=bias, s=stride, p=pad:
+                    for_tex.conv2d(img, k, b, stride=s, padding=p))
+        pt = bench(lambda it=img_t, kt=ker_t, bt=b_t, s=stride, p=pad:
+                    torch.nn.functional.conv2d(it, kt, bt, stride=s, padding=p))
+        sp = speedup(ft, pt)
+        print(f"  {label:<22s} ForTeX: {fmt_time(ft['min']):>10s}  |  PyTorch: {fmt_time(pt['min']):>10s}  |  {sp:.2f}x {verdict(sp)}")
+        rows.append({'label': label, 'fortex': ft, 'pytorch': pt})
+    print_table("Conv2D", rows)
+    return rows
 
-ft_ms = bench("ForTeX gelu", lambda: for_tex.gelu(x), iters=50)
-th_ms = bench("PyTorch gelu", lambda: torch.nn.functional.gelu(x_t).numpy(), iters=50)
-compare("GELU 2048x2048", ft_ms, th_ms)
 
-print("\n" + "=" * 64)
-print("  Benchmark Complete")
-print("=" * 64)
+def bench_softmax():
+    """Softmax"""
+    print("\n" + "=" * 72)
+    print("  5. Softmax")
+    print("=" * 72)
+    print("  ForTeX: 2-pass + AVX-512 exp kernel")
+    print("  PyTorch: torch.softmax → MKL SVML exp")
+
+    configs = [
+        (4, 512, "4×512 (tiny)"), (64, 512, "64×512 (small)"),
+        (1024, 512, "1024×512 (med)"), (4096, 512, "4096×512 (large)"),
+        (1024, 64, "1024×64 (s-dim)"), (1024, 4096, "1024×4096 (l-dim)"),
+    ]
+    rows = []
+    for batch, dim, label in configs:
+        x = np.random.randn(batch, dim)
+        x_t = torch.from_numpy(x)
+        ft = bench(lambda x=x: for_tex.softmax_fn(x))
+        pt = bench(lambda x_t=x_t: torch.softmax(x_t, dim=-1))
+        sp = speedup(ft, pt)
+        print(f"  {label:<22s} ForTeX: {fmt_time(ft['min']):>10s}  |  PyTorch: {fmt_time(pt['min']):>10s}  |  {sp:.2f}x {verdict(sp)}")
+        rows.append({'label': label, 'fortex': ft, 'pytorch': pt})
+    print_table("Softmax", rows)
+    return rows
+
+
+def bench_layernorm():
+    """LayerNorm"""
+    print("\n" + "=" * 72)
+    print("  6. LayerNorm")
+    print("=" * 72)
+    print("  ForTeX: 2-pass (mean/var + normalize/affine)")
+    print("  PyTorch: F.layer_norm → oneDNN fused kernel")
+
+    configs = [
+        (4, 512, "4×512 (tiny)"), (64, 512, "64×512 (small)"),
+        (1024, 512, "1024×512 (med)"), (4096, 512, "4096×512 (large)"),
+        (1024, 64, "1024×64 (s-dim)"), (1024, 4096, "1024×4096 (l-dim)"),
+    ]
+    rows = []
+    for batch, dim, label in configs:
+        x = np.random.randn(batch, dim)
+        gamma = np.ones(dim)
+        beta = np.zeros(dim)
+        x_t = torch.from_numpy(x)
+        g_t = torch.from_numpy(gamma)
+        b_t = torch.from_numpy(beta)
+        ft = bench(lambda x=x, g=gamma, b=beta: for_tex.layernorm(x, g, b, eps=1e-5))
+        pt = bench(lambda xt=x_t, gt=g_t, bt=b_t: torch.nn.functional.layer_norm(xt, (dim,), gt, bt, eps=1e-5))
+        sp = speedup(ft, pt)
+        print(f"  {label:<22s} ForTeX: {fmt_time(ft['min']):>10s}  |  PyTorch: {fmt_time(pt['min']):>10s}  |  {sp:.2f}x {verdict(sp)}")
+        rows.append({'label': label, 'fortex': ft, 'pytorch': pt})
+    print_table("LayerNorm", rows)
+    return rows
+
+
+def bench_gelu():
+    """GELU"""
+    print("\n" + "=" * 72)
+    print("  7. GELU 激活")
+    print("=" * 72)
+    print("  ForTeX: Padé [7/8] 近似 tanh, 完全 SIMD 化")
+    print("  PyTorch: F.gelu → MKL (libm tanh)")
+
+    configs = [((512,512),"512×512"), ((2048,2048),"2048×2048"), ((4096,4096),"4096×4096")]
+    rows = []
+    for shape, label in configs:
+        x = np.random.randn(*shape)
+        x_t = torch.from_numpy(x)
+        ft = bench(lambda x=x: for_tex.gelu(x))
+        pt = bench(lambda x_t=x_t: torch.nn.functional.gelu(x_t))
+        sp = speedup(ft, pt)
+        print(f"  {label:<16s} ForTeX: {fmt_time(ft['min']):>10s}  |  PyTorch: {fmt_time(pt['min']):>10s}  |  {sp:.2f}x {verdict(sp)}")
+        rows.append({'label': label, 'fortex': ft, 'pytorch': pt})
+    print_table("GELU", rows)
+    return rows
+
+
+# ============================================================================
+# 汇总
+# ============================================================================
+
+def print_summary(all_results):
+    print("\n\n" + "=" * 72)
+    print("  SUMMARY")
+    print("=" * 72)
+
+    wins = sum(1 for r in all_results if speedup(r['fortex'], r['pytorch']) > 1.05)
+    ties = sum(1 for r in all_results if 0.95 <= speedup(r['fortex'], r['pytorch']) <= 1.05)
+    losses = sum(1 for r in all_results if speedup(r['fortex'], r['pytorch']) < 0.95)
+
+    print(f"  Total tests:  {len(all_results)}")
+    print(f"  WIN:          {wins}")
+    print(f"  TIE:          {ties}")
+    print(f"  LOSS:         {losses}")
+    print()
+
+    from collections import defaultdict
+    groups = defaultdict(list)
+    for r in all_results:
+        groups[r['group']].append(r)
+
+    print(f"  {'Operator':<20s}  {'Tests':>5s}  {'Min Speedup':>12s}  {'Max Speedup':>12s}  {'Verdict':>10s}")
+    print(f"  {'─'*20}  {'─'*5}  {'─'*12}  {'─'*12}  {'─'*10}")
+    for group, items in groups.items():
+        sps = [speedup(it['fortex'], it['pytorch']) for it in items]
+        mn, mx = min(sps), max(sps)
+        if mn > 1.05:
+            v = "WIN"
+        elif mx < 0.95:
+            v = "LOSS"
+        else:
+            v = "MIXED"
+        print(f"  {group:<20s}  {len(items):>5d}  {mn:>11.2f}x  {mx:>11.2f}x  {v:>10s}")
+
+    print()
+    print("  Speedup = PyTorch_min / ForTeX_min")
+    print("  > 1.0 → ForTeX faster;  < 1.0 → PyTorch faster")
+    print("=" * 72)
+
+
+# ============================================================================
+# 主入口
+# ============================================================================
+
+if __name__ == "__main__":
+    print_header()
+
+    all_results = []
+
+    # 为每个结果附加 group 标签
+    def tag(group, rows):
+        for r in rows:
+            r['group'] = group
+        all_results.extend(rows)
+
+    tag("GEMM",              bench_gemm())
+    tag("Simple GEMM",       bench_simple_gemm())
+    tag("Linear+ReLU",       bench_linear_relu())
+    tag("Conv2D",            bench_conv2d())
+    tag("Softmax",           bench_softmax())
+    tag("LayerNorm",         bench_layernorm())
+    tag("GELU",              bench_gelu())
+
+    print_summary(all_results)

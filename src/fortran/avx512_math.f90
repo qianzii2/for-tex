@@ -1,5 +1,5 @@
 !==============================================================================
-! ForTeX AVX-512 Math Kernels — 手写 SIMD 实现
+! ForTeX AVX-512 Math Kernels — SIMD exp/log
 !
 ! ★★★ Round-16 云平台全优化 ★★★
 !
@@ -13,7 +13,7 @@ module avx512_math
     use, intrinsic :: iso_fortran_env, only: real64
     implicit none
     private
-    public :: exp_avx512, log_avx512
+    public :: exp_avx512, log_avx512, exp_avx512_sum
 
     ! 常量
     real(real64), parameter :: LN2      = 0.69314718055994530942_real64
@@ -101,6 +101,48 @@ contains
         end do
         !$omp end simd
     end subroutine exp_avx512
+
+    !--------------------------------------------------------------------------
+    ! ★ exp(x-shift) + sum — 融合版本，消除 softmax 的独立 shift+sum 循环
+    !   返回: y(i) = exp(x(i) - shift), s = sum(y(1:n))
+    !--------------------------------------------------------------------------
+    subroutine exp_avx512_sum(n, x, shift, y, s)
+        integer, intent(in) :: n
+        real(real64), intent(in) :: x(*)
+        real(real64), intent(in) :: shift
+        real(real64), intent(out) :: y(*)
+        real(real64), intent(out) :: s
+        integer :: i
+        real(real64) :: xi, yi, ri, num, den, pi
+        real(real64) :: inv_ln2_local, sum_local
+        integer :: ni
+
+        inv_ln2_local = INV_LN2
+        sum_local = 0.0_real64
+
+        !$omp simd private(i, xi, yi, ri, num, den, pi, ni) reduction(+:sum_local)
+        do i = 1, n
+            xi = x(i) - shift
+
+            if (xi > 700.0_real64) then
+                pi = 1.0e308_real64
+            else if (xi < -700.0_real64) then
+                pi = 0.0_real64
+            else
+                yi = xi * inv_ln2_local
+                ni = int(anint(yi))
+                ri = yi - real(ni, real64)
+                num = 1.0_real64 + ri * EXP_PADE_A
+                den = 1.0_real64 + ri * EXP_PADE_C
+                pi = num / den
+                pi = pi * (2.0_real64 ** ni)
+            end if
+            y(i) = pi
+            sum_local = sum_local + pi
+        end do
+        !$omp end simd
+        s = sum_local
+    end subroutine exp_avx512_sum
 
     !--------------------------------------------------------------------------
     ! ★ log(x) — AVX-512 SIMD + OpenMP 并行

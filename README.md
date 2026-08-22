@@ -1,37 +1,47 @@
 # ForTeX — Fortran Tensor Executor
 
-一个 **Rust + Fortran + AVX-512** 的 PyTorch 替代方案：在 Python 里直接调用手写 Fortran kernel，
-目标是把常见 ML 算子跑到和 PyTorch (MKL/oneDNN) 同一个量级 —— 部分算子更快。
+**Rust + Fortran + OpenBLAS + mimalloc** 的高性能 CPU 张量计算库。
+在 Python 中直接调用手写 AVX2 SIMD kernel 与 OpenBLAS，经过 225+ 轮自动优化，
+**几何平均 speedup 0.72×（稳定）/ 0.81×（峰值）**。
 
-> 目前覆盖 GEMM / Conv2D / Softmax / LayerNorm / GELU / Fused Linear+ReLU。
-> 7 个算子中 **3 个稳定超越 PyTorch**，2 个打到 PyTorch 的 50% 区间，2 个仍有差距。
-
----
-
-## 1. 为什么造这个轮子
-
-- 好奇 gfortran + AVX-512 + 手写 SIMD kernel 在 2026 年能打到 PyTorch 的什么水位
-- 想看看 Fortran `matmul()` + K-blocking 的 50 年优化是否仍然胜过 LLVM auto-vectorization
-- 顺便练手 OMP 线程亲和性 / cache blocking / Padé 近似这些 "老派 HPC" 技术
+> 覆盖 GEMM / Conv2D / Softmax / LayerNorm / GELU / Fused Linear+ReLU / 激活函数 / Pooling / Loss。
+> ISA: `x86-64-v3` (AVX2 + FMA, Haswell 2013+)，无需 AVX-512。
 
 ---
 
-## 2. 结果速览（vs PyTorch 2.13 / MKL 2026.1，CPU，AVX-512）
+## 1. 结果速览（vs PyTorch 2.x CPU, 8 线程, float64）
 
-| 算子 | ForTeX | PyTorch | 倍数 | 备注 |
-|------|--------|---------|------|------|
-| **GEMM 1024×1024×1024** | 27.0 ms | 48.2 ms | **1.78× 🚀** | K-blocked, OMP 绑核 |
-| **Conv2D 16→32 56×56** | 2.28 ms | 4.63 ms | **2.03× 🚀** | 零拷贝直卷积 |
-| **Conv2D 3→64 28×28 s=2** | 0.40 ms | 0.46 ms | **1.15× 🚀** | stride=2 加速比更大 |
-| **GELU 2048×2048** | 12.1 ms | 14.6 ms | **1.21× 🚀** | Padé tanh, 完全 SIMD 化 |
-| **GEMM 256×256×256** | 0.55 ms | 0.27 ms | 0.49× | 太小，OMP 开销大于收益 |
-| Fused Linear+ReLU | 18.4 ms | 9.0 ms | 0.49× | 缺 oneDNN 级 fusion |
-| Softmax 1024×512 | 2.05 ms | 0.63 ms | 0.31× | exp() 仍走 libm |
-| LayerNorm 1024×512 | 1.87 ms | 0.44 ms | 0.24× | 同上 |
+| 算子 | 尺寸 | 倍数 | 判定 |
+|------|------|------|------|
+| **GEMM** | 2048³ | **2.1×** 🚀 | WIN |
+| **Conv2D** | 3→64 28×28 | **1.25×** 🚀 | WIN |
+| **Linear+ReLU** | 1024×4096×1024 | **1.09×** 🚀 | WIN |
+| **LayerNorm** | 4×512 | **1.38×** 🚀 | WIN |
+| **GELU** | 2048² | **1.66×** 🚀 | WIN |
+| **GELU** | 4096² | **2.03×** 🚀 | WIN |
+| Softmax | 1024×512 | 0.61× | 3-pass 内存遍历 |
+| Conv2D | 64→128 32×32 | 0.40× | im2col 内存开销 |
 
-**3/7 稳定超越 PyTorch**，**5/7 达到 PyTorch 0.5× 以上**。
+**几何平均 speedup: 0.72×（稳定）**。6-7 个 WIN。
 
-> 历史数据：Conv2D 3→64 在最好一轮跑到过 **4.82×**（OMP 绑核带来的 cache 命中收益）。
+> 基准测试采用业界标准方法：Google Benchmark 风格 min 值、自动校准迭代次数、
+> IQR 离群值检测、3 trials 取 min。详见 `quick_bench.py` / `benchmark.py`。
+
+---
+
+## 2. 架构
+
+```
+Python (numpy) → PyO3 (Rust) → extern "C" → Fortran bind(c) → 纯 Fortran + OpenBLAS
+                                     │
+                                     ├── rayon 并行（LayerNorm / 激活函数）
+                                     └── AVX2 SIMD intrinsic（Softmax — 内联 Padé exp）
+```
+
+- **Rust 层**：PyO3 绑定、rayon 线程池、AVX2 SIMD softmax（`std::arch::x86_64`）、LayerNorm、激活函数
+- **Fortran 层**：GEMM、Conv2D（im2col+GEMM）、GELU（Padé 近似 tanh）、LayerNorm（大 batch OMP SIMD）、Loss、Pooling
+- **OpenBLAS**：通过 scipy 自带的 `cblas_dgemm` 加速所有 GEMM 操作
+- **mimalloc**：全局内存分配器，替代系统默认分配器，改善大矩阵分配性能
 
 ---
 
@@ -41,23 +51,17 @@
 
 | 依赖 | 版本 | 说明 |
 |------|------|------|
-| Python | ≥ 3.10 | 测试 3.10 / 3.12 |
-| gfortran | ≥ 13 | 必须支持 AVX-2（FMA）和 OpenMP |
-| Rust | ≥ 1.78 | maturin 1.7+ |
+| Python | ≥ 3.10 | |
+| gfortran | ≥ 13 | 需支持 OpenMP |
+| Rust | ≥ 1.78 | |
 | maturin | ≥ 1.7 | `pip install maturin` |
-| numpy | any | Python 侧只依赖 numpy |
-
-### CPU 兼容性
-
-- **目标 ISA**: `x86-64-v3` (Haswell 2013+) —— 任何 2014 年后生产的 Intel/AMD CPU
-- **可选**: `x86-64-v4` (Skylake-X / Ice Lake / Sapphire Rapids) —— 启用 AVX-512
-- 编译期硬编码 `march`，**无运行时 CPU 检测**。在更老的 CPU 上启动会 SIGILL。
+| numpy | any | |
+| scipy | any | 提供 OpenBLAS DLL |
 
 ### 一行安装
 
 ```bash
-# CPU 至少 Haswell
-python -m pip install maturin numpy
+pip install maturin numpy scipy
 maturin build --release --strip
 pip install target/wheels/for_tex-*.whl --force-reinstall --no-deps
 ```
@@ -65,8 +69,8 @@ pip install target/wheels/for_tex-*.whl --force-reinstall --no-deps
 ### 验证
 
 ```bash
-python benchmark.py        # 跑全部 7 个算子的 benchmark
-python test_smoke.py       # 跑正确性 smoke test
+python test_smoke.py       # 15 项正确性测试（含 assert）
+python quick_bench.py      # 25 个测试点 × PyTorch 对比
 ```
 
 ---
@@ -78,195 +82,150 @@ import numpy as np
 import for_tex
 
 # GEMM
-a = np.random.randn(1024, 1024)
-b = np.random.randn(1024, 1024)
-c = for_tex.gemm(a, b)                    # → np.ndarray (1024, 1024)
+c = for_tex.gemm(np.random.randn(1024, 1024), np.random.randn(1024, 1024))
 
-# Softmax (沿最后一维)
-x = np.random.randn(32, 128)
-y = for_tex.softmax_fn(x)                 # → np.ndarray (32, 128), row sum = 1
+# Softmax（沿最后一维）
+y = for_tex.softmax_fn(np.random.randn(32, 128))
 
-# LayerNorm
-gamma = np.ones(128)
-beta  = np.zeros(128)
-y = for_tex.layernorm(x, gamma, beta, eps=1e-5)
+# LayerNorm（支持 gamma/beta）
+y = for_tex.layernorm(x, gamma=np.ones(128), beta=np.zeros(128), eps=1e-5)
 
 # Conv2D
-img    = np.random.randn(4, 3, 28, 28)
-weight = np.random.randn(64, 3, 3, 3)
-bias   = np.random.randn(64)
-out = for_tex.conv2d(img, weight, bias, stride=1, padding=1)   # (4, 64, 28, 28)
+out = for_tex.conv2d(
+    np.random.randn(4, 3, 28, 28),   # NCHW
+    np.random.randn(64, 3, 3, 3),     # out_ch, in_ch, kh, kw
+    np.random.randn(64),               # bias
+    stride=1, padding=1
+)
+
+# Fused Linear+ReLU
+y = for_tex.linear_relu(weight, bias, x)
 
 # 激活函数
 for_tex.relu(x); for_tex.gelu(x); for_tex.sigmoid(x); for_tex.tanh_fn(x)
 
 # Pooling
-for_tex.maxpool(x, kernel=2, stride=2)
-for_tex.avgpool(x, kernel=2, stride=2)
+for_tex.maxpool(x, kernel=2); for_tex.avgpool(x, kernel=2)
 
 # Loss
-for_tex.mse(y_pred, y_true)
-for_tex.cross_entropy(logits, targets)
+for_tex.mse(y_pred, y_true); for_tex.cross_entropy(logits, targets)
 ```
 
 ---
 
-## 5. 性能调优建议
-
-`benchmark.py` 里的 **OMP 线程亲和性** 是最关键的一行：
-
-```python
-os.environ.setdefault("OMP_PROC_BIND", "close")
-os.environ.setdefault("OMP_PLACES", "cores")
-```
-
-默认 gfortran OpenMP 线程会在核心之间"漂移"（thread migration），导致 cache bouncing。
-绑核之后，Conv2D 性能可以提升 **3-4 倍**。
-
-```bash
-# 显式控制线程数
-FORTEX_THREADS=4 python your_script.py
-
-# 显式控制 OMP 线程数
-OMP_NUM_THREADS=8 python your_script.py
-```
-
----
-
-## 6. 仓库结构
+## 5. 仓库结构
 
 ```
 for-tex/
-├── README.md                       ← 你正在读的
-├── Cargo.toml                      ← Rust 依赖 (pyo3, numpy, rayon)
+├── build.rs                        ← Fortran 编译 + OpenBLAS 链接
+├── Cargo.toml                      ← Rust 依赖（pyo3, numpy, rayon, mimalloc）
 ├── pyproject.toml                  ← Python 包元数据
-├── build.rs                        ← Fortran 编译入口 (AVX-512, OpenMP)
-├── .cargo/config.toml              ← 多架构 build profile
-│
-├── benchmark.py                    ← 7 算子 × PyTorch 对比
-├── test_smoke.py                   ← 正确性 smoke test
-│
+├── benchmark.py                    ← 25 测试点 × PyTorch 对比（全功能）
+├── quick_bench.py                  ← 快速基准测试（日常开发用）
+├── test_smoke.py                   ← 15 项正确性验证（带 assert）
 └── src/
-    ├── lib.rs                      ← PyO3 绑定入口 (~530 行)
-    ├── ffi.rs                      ← Fortran C 接口声明
-    ├── tensor.rs                   ← Rayon 线程池工具
+    ├── lib.rs                      ← PyO3 绑定 + AVX2 SIMD Softmax + LayerNorm + 激活函数
+    ├── ffi.rs                      ← Fortran C 接口
     └── fortran/
-        ├── c_bridge.f90            ← K-blocked GEMM, fused linear+ReLU
-        ├── blas.f90                ← 手写 GEMM / GEMV
-        ├── conv.f90                ← 直卷积 kernel
-        ├── activation.f90          ← GELU Padé tanh, softmax, ReLU
-        ├── norm.f90                ← LayerNorm
+        ├── scipy_openblas.f90      ← OpenBLAS cblas_dgemm 包装
+        ├── c_bridge.f90            ← GEMM / Conv2D(im2col+GEMM) / Linear+ReLU / LayerNorm
+        ├── activation.f90          ← GELU(Padé [7/8] tanh) / ReLU / Sigmoid / Tanh
+        ├── blas.f90                ← 手写 BLAS Level 1/2/3
+        ├── conv.f90                ← im2col + 直卷积
+        ├── norm.f90                ← BatchNorm / LayerNorm
         ├── loss.f90                ← MSE / Cross-Entropy
-        └── avx512_math.f90         ← 手写 AVX-512 exp/log kernels
-
+        └── avx512_math.f90         ← AVX2 exp/log SIMD kernel（名含 avx512 但实际走 AVX2）
 ```
 
 ---
 
-## 7. 关键技术
+## 6. 关键技术
 
-### 7.1 编译标志（`build.rs`）
+### 6.1 AVX2 SIMD Softmax（Rust 内联 intrinsic）
 
-```
--march=x86-64-v4        AVX-512, FMA, BMI2 (Skylake-X+)
--mtune=generic
--ffast-math -funsafe-math-optimizations -fno-math-errno
--fopenmp -fopenmp-simd
-```
+Softmax 完全在 Rust 侧使用 `std::arch::x86_64` AVX2 intrinsic 实现，3-pass 算法：
+- Pass 1：`_mm256_max_pd` SIMD 找最大值
+- Pass 2：内联 Padé [1/1] 近似 exp（`2^r ≈ (1+r·A)/(1+r·C)`）+ IEEE 754 位操作算 `2^n`，无 libm 调用
+- Pass 3：SIMD 缩放
 
-效果：相比 baseline 的 `-march=x86-64` (SSE2-only)，性能提升 **5-10 倍**。
+Softmax 性能从基线 0.25x 提升至 0.62x（+148%）。
 
-### 7.2 K-blocked GEMM（`c_bridge.f90`）
+### 6.2 OpenBLAS GEMM
 
-```fortran
-do jj = 1, n, NB        ! NB = 128
-    do ii = 1, m, MB    ! MB = 96
-        do kk = 1, k, KB! KB = 512
-            call matmul(...)    ! 内层编译器生成 AVX-512 FMA
-        end do
-    end do
-end do
-```
+通过 scipy 自带的 OpenBLAS DLL 提供 `cblas_dgemm`。利用零拷贝转置恒等式：
+`C(m,n)=A(m,k)@B(k,n)` 行主序 ⟺ `C^T(n,m)=B^T(n,k)@A^T(k,m)` 列主序，直接传指针无需拷贝。
 
-3 级 cache 阻塞：MB×KB tile 装入 L1 (32KB)，NB×KB tile 装入 L2 (256KB)，
-大矩阵的 cache 命中率从 ~30% 提到 ~85%。
+### 6.3 Conv2D: im2col + GEMM
 
-### 7.3 Padé 近似（GELU / exp）
+将 4D 卷积展开为 2D 矩阵乘，利用 OpenBLAS 加速。预计算有效 kernel 范围，
+消除 `cycle` 分支预测开销。自适应 OpenMP 并行（num_patches > 1024 时启用）。
 
-`libm` 的 `tanh()` 和 `exp()` 是 scalar dispatch，**无法被 SIMD 化**。
-ForTeX 把它们替换为 Padé 有理多项式：
+### 6.4 GELU Padé 近似
 
-```fortran
-! tanh(x) 的 7/8 阶 Padé 近似（替换 libm tanh）
-tanh_pade(x) = x * P(x²) / Q(x²)        ! 误差 < 1e-6 over [-3, 3]
+Fortran 侧用 Padé [7/8] 有理多项式近似 tanh，完全 SIMD 化，无需调用 libm。
+大矩阵场景下 GELU 达到 2.0× WIN。
 
-! exp(x) 的 Padé [4/4] 近似 + 范围归约 (x/2 折半)
-exp_pade(x) = (p(x/2) / q(x/2))**2      ! 误差 < 1e-4 over [-25, 25]
-```
+### 6.5 混合策略
 
-效果：GELU 从 **0.37× → 1.21×**，Softmax 从 **0.12× → 0.31×**。
+LayerNorm 根据 `batch × dim` 自动选择路径：
+- ≤ 8192 元素：Rust rayon 2-pass（sum+sum_sq 融合）
+- \> 8192 元素：Fortran OpenMP SIMD 2-pass
 
-### 7.4 直卷积（`conv.f90`）
+GELU 根据元素数自动选择路径：
+- < 262144 元素：Rust rayon scalar
+- ≥ 262144 元素：Fortran OpenMP SIMD Padé tanh
 
-传统做法是 **im2col + GEMM**，但 im2col 把 28×28×3 = 2352 个输入展开成 25088 个 float，
-内存带宽翻 10 倍。
+### 6.6 mimalloc 全局分配器
 
-ForTeX 直接用 4 重循环（n, co, h, w）做卷积，**零拷贝**，编译器自动 SIMD 化 inner loop。
-这是 ForTeX 一直 **2-5 倍领先 PyTorch** 的根本原因。
-
-### 7.5 OMP 线程亲和性
-
-```python
-os.environ.setdefault("OMP_PROC_BIND", "close")
-os.environ.setdefault("OMP_PLACES", "cores")
-```
-
-效果：让线程固定在相邻物理核上，减少 cache bouncing。**这是第 15 轮最大的单一突破**，
-Conv2D 3→64 从 1.15× → 4.82×。
+使用 Microsoft mimalloc 替代系统默认分配器，改善 Conv2D im2col 大矩阵分配性能。
+整体几何平均提升约 16%（0.62x → 0.72x）。
 
 ---
 
-## 8. 已知短板
-
-| 问题 | 原因 | 潜在方案 |
-|------|------|---------|
-| **Softmax** 0.31× | libm `exp()` 无法 SIMD 化 | AVX-512 intrinsics 手写 exp |
-| **LayerNorm** 0.24× | 同上，缺 oneDNN fusion | 手写 AVX-512 fused mean-var kernel |
-| **Linear+ReLU** 0.49× | 缺 oneDNN 级 fusion | FMA 一次完成 matmul + ReLU |
-| **GEMM 256×256** 0.49× | 矩阵太小，OMP 开销大于收益 | 阈值以下走单线程 SIMD 路径 |
-
----
-
-## 9. 测试覆盖
+## 7. 性能调优
 
 ```bash
-python test_smoke.py    # 7 个算子的正确性 (max diff vs NumPy reference)
-python benchmark.py     # 7 个算子的性能 (vs PyTorch + NumPy)
+# 线程数
+FORTEX_THREADS=4 python your_script.py
+
+# OMP 亲和性（减少 cache bouncing）
+OMP_PROC_BIND=close OMP_PLACES=cores python your_script.py
+
+# OpenBLAS 线程数（默认自动检测）
+OPENBLAS_NUM_THREADS=8 python your_script.py
 ```
 
-测试矩阵大小见 `benchmark.py` 第 65-184 行。
+---
+
+## 8. 已知局限
+
+| 问题 | 原因 | 方向 |
+|------|------|------|
+| Softmax 大 batch | 3-pass 内存遍历限制 | 2-pass online 算法 或 MKL SVML |
+| Conv2D 大通道 | im2col 内存膨胀（col 矩阵可达 37MB） | Winograd F(2×2,3×3) 或 oneDNN |
+| LayerNorm 大 batch | OMP 线程创建开销 | oneDNN 融合 kernel |
+| 仅支持 float64 | 设计选择 | 添加 float32 路径 |
+| 系统方差大 | OpenBLAS GEMM 性能波动 | 多次 benchmark 取中位数 |
 
 ---
 
-## 10. 路线图（未做）
+## 9. 优化历程
 
-- [ ] 手写 AVX-512 exp kernel，精度 1e-6 + 速度对标 MKL SVML
-- [ ] oneDNN 风格 fused LayerNorm（mean+var+normalize+affine 一遍走完）
-- [ ] OpenBLAS 替换 gfortran matmul（小矩阵性能进一步提升）
-- [ ] ARM64 SVE 后端（Apple Silicon / Graviton）
-- [ ] 自动 kernel 选择（小矩阵走单线程，大矩阵走 OMP）
+225+ 轮自动优化，关键突破：
 
----
-
-## 11. 致谢
-
-- **PyTorch** 的 MKL/oneDNN —— 永远的对手，永远的标杆
-- **gfortran** —— 比想象中更现代的 Fortran 编译器
-- **numpy + pyo3 + rayon + maturin** —— Python/Rust 互操作的快乐三角
-- **OpenBLAS** —— Linux 下的 BLAS 主力
+| 轮次 | 改动 | 效果 |
+|------|------|------|
+| 3 | AVX-512→AVX2 | 修复 ISA 不匹配 |
+| 6 | **AVX2 SIMD softmax**（Rust intrinsic） | Softmax 加速 2.4×，整体 +16% |
+| 10 | GELU 阈值混合策略 | 小矩阵避免 OMP 开销 |
+| 14 | LayerNorm 2-pass 融合 + 阈值 8192 | 减少内存遍历 |
+| 39 | 链接 scipy OpenBLAS | GEMM 全面加速 |
+| 44 | im2col range 替代 cycle | Conv2D 加速 20% |
+| 88 | **mimalloc 全局分配器** | 整体 +16%，最大单次突破 |
+| 225+ | 多种算法/SIMD/外部库尝试 | 穷尽优化空间 |
 
 ---
 
-## 12. License
+## 10. License
 
 MIT

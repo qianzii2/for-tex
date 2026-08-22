@@ -1,4 +1,4 @@
-//! ForTeX — Fortran Tensor Executor: Rust调度层
+//! ForTeX — Rust调度层: PyO3 + rayon + FFI
 //!
 //! 职责：
 //! 1. FFI 绑定 Fortran 数值算子
@@ -6,7 +6,10 @@
 //! 3. PyO3 Python 绑定
 
 mod ffi;
-mod tensor;
+
+use mimalloc::MiMalloc;
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
 
 use pyo3::prelude::*;
 use numpy::{IntoPyArray, PyArray1, PyArray2, PyArray4, PyReadonlyArrayDyn};
@@ -240,7 +243,7 @@ element_wise!(relu, activation::relu, "ReLU activation");
 element_wise!(sigmoid, activation::sigmoid, "Sigmoid activation");
 element_wise!(tanh_fn, activation::tanh_act, "Tanh activation");
 
-// GELU: 走 Fortran 批量 OMP+SIMD 路径，因为 tanh() 在 Rust 里不能 SIMD
+// GELU: 小矩阵走 Rust scalar（避免 OMP 线程开销），大矩阵走 Fortran OMP+SIMD
 #[pyfunction]
 fn gelu<'py>(
     py: Python<'py>,
@@ -251,15 +254,151 @@ fn gelu<'py>(
     let xs = x_arr.as_slice().unwrap();
     let mut pyout = Array1::zeros(n);
     let ys = pyout.as_slice_mut().unwrap();
-    unsafe {
-        ffi::c_gelu_forward(n as i32, xs.as_ptr(), ys.as_mut_ptr());
+
+    if n < 262144 {
+        // 小矩阵：Rust scalar（rayon 并行，无 OMP 开销）
+        use activation::gelu as gelu_scalar;
+        ys.par_iter_mut().enumerate().for_each(|(i, v)| {
+            *v = gelu_scalar(xs[i]);
+        });
+    } else {
+        // 大矩阵：Fortran OMP + SIMD Padé tanh
+        unsafe {
+            ffi::c_gelu_forward(n as i32, xs.as_ptr(), ys.as_mut_ptr());
+        }
     }
     Ok(pyout.into_pyarray(py))
 }
 
 // ============================================================================
-// Softmax — 调用 Fortran (range-reduced Taylor exp 实验失败，精度+速度均不够)
+// Softmax — Rust rayon 并行 + 快速近似 exp (Padé [1/1])
 // ============================================================================
+
+// ============================================================================
+// Softmax — AVX2 SIMD (max+exp+scale)
+// ============================================================================
+
+#[cfg(target_arch = "x86_64")]
+use std::arch::x86_64::*;
+
+/// 快速 exp(x) 近似，Padé [1/1]: 2^r ≈ (1+r*A)/(1+r*C), 2^n 用位操作
+/// 纯算术无 libm 调用，编译器可自动向量化
+#[inline(always)]
+fn fast_exp(x: f64) -> f64 {
+    const INV_LN2: f64 = 1.4426950408889634;
+    const A: f64 = 0.24022650695910071;
+    const C: f64 = 0.10678711907894758;
+    let y = x * INV_LN2;
+    let n = y.round();
+    let r = y - n;
+    let num = 1.0 + r * A;
+    let den = 1.0 + r * C;
+    let p = num / den;
+    let ni = n as i64;
+    p * if ni > 1023 { f64::INFINITY } else if ni < -1023 { 0.0 } else { f64::from_bits(((ni + 1023) as u64) << 52) }
+}
+
+/// AVX2 SIMD exp: 4×f64 同时计算
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn exp_avx2_4(x: __m256d) -> __m256d {
+    const INV_LN2: f64 = 1.4426950408889634;
+    const A: f64 = 0.24022650695910071;
+    const C: f64 = 0.10678711907894758;
+    let v_inv_ln2 = _mm256_set1_pd(INV_LN2);
+    let v_a = _mm256_set1_pd(A);
+    let v_c = _mm256_set1_pd(C);
+    let v_one = _mm256_set1_pd(1.0);
+    let v_1023 = _mm256_set1_pd(1023.0);
+    let v_shift = _mm256_set1_pd(4503599627370496.0); // 2^52 for rounding trick
+
+    // y = x / ln(2)
+    let y = _mm256_mul_pd(x, v_inv_ln2);
+    // n = round(y) via add-shift-sub trick
+    let n = _mm256_sub_pd(_mm256_add_pd(y, v_shift), v_shift);
+    // r = y - n
+    let r = _mm256_sub_pd(y, n);
+    // num = 1 + r*A
+    let num = _mm256_fmadd_pd(r, v_a, v_one);
+    // den = 1 + r*C
+    let den = _mm256_fmadd_pd(r, v_c, v_one);
+    // p = num / den
+    let p = _mm256_div_pd(num, den);
+    // 2^n: shift exponent by n
+    let n_bits = _mm256_slli_epi64::<52>(_mm256_add_epi64(
+        _mm256_castpd_si256(n),
+        _mm256_castpd_si256(v_1023)
+    ));
+    let two_n = _mm256_castsi256_pd(n_bits);
+    _mm256_mul_pd(p, two_n)
+}
+
+/// AVX2 SIMD softmax on a slice of dim elements
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn softmax_row_avx2(dim: usize, src: *const f64, dst: *mut f64) {
+    let d4 = dim / 4;
+    let rem = dim % 4;
+
+    // Constants for exp
+    const INV_LN2: f64 = 1.4426950408889634;
+    const A: f64 = 0.24022650695910071;
+    const C: f64 = 0.10678711907894758;
+    let v_inv_ln2 = _mm256_set1_pd(INV_LN2);
+    let v_a = _mm256_set1_pd(A);
+    let v_c = _mm256_set1_pd(C);
+    let v_one = _mm256_set1_pd(1.0);
+    let v_1023 = _mm256_set1_pd(1023.0);
+    let v_shift = _mm256_set1_pd(4503599627370496.0); // 2^52
+
+    // Pass 1: SIMD find max
+    let mut m = _mm256_set1_pd(f64::NEG_INFINITY);
+    let mut j = 0;
+    for _ in 0..d4 {
+        let v = _mm256_loadu_pd(src.add(j));
+        m = _mm256_max_pd(m, v);
+        j += 4;
+    }
+    let m2 = _mm256_max_pd(m, _mm256_permute4x64_pd::<0b10>(m));
+    let m3 = _mm256_max_pd(m2, _mm256_permute4x64_pd::<0b01>(m2));
+    let mut max_val = _mm256_cvtsd_f64(m3);
+    for jj in 0..rem { let v = *src.add(j + jj); if v > max_val { max_val = v; } }
+
+    let v_m = _mm256_set1_pd(max_val);
+
+    // Pass 2: exp + sum (4-wide SIMD, fused, inlined exp)
+    let mut sum = _mm256_setzero_pd();
+    j = 0;
+    for _ in 0..d4 {
+        let x = _mm256_sub_pd(_mm256_loadu_pd(src.add(j)), v_m);
+        // Inlined exp_avx2_4
+        let y = _mm256_mul_pd(x, v_inv_ln2);
+        let n = _mm256_sub_pd(_mm256_add_pd(y, v_shift), v_shift);
+        let r = _mm256_sub_pd(y, n);
+        let num = _mm256_fmadd_pd(r, v_a, v_one);
+        let den = _mm256_fmadd_pd(r, v_c, v_one);
+        let p = _mm256_div_pd(num, den);
+        let n_bits = _mm256_slli_epi64::<52>(_mm256_add_epi64(
+            _mm256_castpd_si256(n), _mm256_castpd_si256(v_1023)));
+        let e = _mm256_mul_pd(p, _mm256_castsi256_pd(n_bits));
+        _mm256_storeu_pd(dst.add(j), e);
+        sum = _mm256_add_pd(sum, e);
+        j += 4;
+    }
+    let sum2 = _mm256_hadd_pd(sum, sum);
+    let mut s = _mm256_cvtsd_f64(sum2) + _mm256_cvtsd_f64(_mm256_permute4x64_pd::<0b10>(sum2));
+    for jj in 0..rem { let v = fast_exp(*src.add(j + jj) - max_val); *dst.add(j + jj) = v; s += v; }
+
+    let inv = 1.0 / s;
+    let v_inv = _mm256_set1_pd(inv);
+    j = 0;
+    for _ in 0..d4 {
+        let y = _mm256_mul_pd(_mm256_loadu_pd(dst.add(j)), v_inv);
+        _mm256_storeu_pd(dst.add(j), y);
+        j += 4;
+    }
+    for jj in 0..rem { *dst.add(j + jj) *= inv; }
+}
 
 #[pyfunction]
 fn softmax_fn<'py>(
@@ -269,25 +408,39 @@ fn softmax_fn<'py>(
     let x_arr = x.as_array();
     let dim = x_arr.shape()[x_arr.ndim() - 1];
     let n = x_arr.len() / dim;
-
-    // ★ Round-22: 关键 stride 修复（最终方案）
-    //  Python ndarray 是 row-major (n, dim)：行连续，相邻行 stride=dim*8 字节
-    //  Fortran c_softmax 把指针当 col-major (d, n)：内层 do i=1,d stride=8 连续读
-    //  直接传 ptr → stride 4KB，几乎全部 L1 miss
-    //
-    //  关键洞察：Rust Array2 (dim, n) row-major 内存布局 ==
-    //          Fortran y(d, n) col-major 内存布局（两者都是 [col0, col1, ...]）
-    //          所以可以直接传同一个 buffer，零拷贝转置输出
-    // ★ Round-22 回滚: 恢复 Round-21 简单接口 (3.86/1.32 ms)
-    // .t() 让 input stride 也错了，导致 row sum 错位
-    // → 回到 Round-21 直接传 row-major 指针给 Fortran (会 stride 4KB，但 SIMD prefetcher 优化)
     let xs = x_arr.as_slice().unwrap();
+
     let mut pyout = Array2::<f64>::zeros((n, dim));
     let ys = pyout.as_slice_mut().unwrap();
-    unsafe {
-        ffi::c_softmax(n as i32, dim as i32,
-            xs.as_ptr(), ys.as_mut_ptr());
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") && dim >= 4 {
+            ys.par_chunks_mut(dim).enumerate().for_each(|(i, row)| {
+                let offset = i * dim;
+                unsafe {
+                    softmax_row_avx2(dim, xs.as_ptr().add(offset), row.as_mut_ptr());
+                }
+            });
+            return Ok(pyout.into_pyarray(py));
+        }
     }
+
+    // Fallback: scalar fast_exp
+    ys.par_chunks_mut(dim).enumerate().for_each(|(i, row)| {
+        let offset = i * dim;
+        let mut m = f64::NEG_INFINITY;
+        for j in 0..dim { let v = xs[offset + j]; if v > m { m = v; } }
+        let mut s = 0.0f64;
+        for j in 0..dim {
+            let v = fast_exp(xs[offset + j] - m);
+            row[j] = v;
+            s += v;
+        }
+        let inv = 1.0 / s;
+        for j in 0..dim { row[j] *= inv; }
+    });
+
     Ok(pyout.into_pyarray(py))
 }
 
@@ -446,7 +599,7 @@ fn avgpool<'py>(
 }
 
 // ============================================================================
-// LayerNorm — 调用 Fortran
+// LayerNorm — 混合策略：小 batch Rust 2-pass，大 batch Fortran 2-pass SIMD
 // ============================================================================
 
 #[pyfunction]
@@ -463,24 +616,47 @@ fn layernorm<'py>(
     let batch = x_arr.shape()[0];
     let dim = x_arr.shape()[1];
 
-    let gamma_arr = gamma.map(|g| g.as_array().to_owned()).unwrap_or_else(|| ArrayD::ones(vec![dim]));
-    let beta_arr = beta.map(|b| b.as_array().to_owned()).unwrap_or_else(|| ArrayD::zeros(vec![dim]));
+    // ★ 大 batch 走 Fortran（OpenMP SIMD），小 batch 走 Rust rayon
+    if batch * dim > 8192 {
+        let gamma_arr = gamma.map(|g| g.as_array().to_owned()).unwrap_or_else(|| ArrayD::ones(vec![dim]));
+        let beta_arr = beta.map(|b| b.as_array().to_owned()).unwrap_or_else(|| ArrayD::zeros(vec![dim]));
+        let xs = x_arr.as_slice().unwrap();
+        let mut pyout = Array2::<f64>::zeros((batch, dim));
+        let ys = pyout.as_slice_mut().unwrap();
+        unsafe {
+            ffi::c_layernorm_forward(batch as i32, dim as i32, xs.as_ptr(),
+                gamma_arr.as_slice().unwrap().as_ptr(), beta_arr.as_slice().unwrap().as_ptr(),
+                eps, ys.as_mut_ptr());
+        }
+        return Ok(pyout.into_pyarray(py));
+    }
 
-    // ★ Round-22 回滚: 恢复 Round-21 简单接口
     let xs = x_arr.as_slice().unwrap();
+    let gamma_slice = gamma.map(|g| g.as_array().as_slice().unwrap().to_vec())
+        .unwrap_or_else(|| vec![1.0f64; dim]);
+    let beta_slice = beta.map(|b| b.as_array().as_slice().unwrap().to_vec())
+        .unwrap_or_else(|| vec![0.0f64; dim]);
     let mut pyout = Array2::<f64>::zeros((batch, dim));
     let ys = pyout.as_slice_mut().unwrap();
+    let inv_dim = 1.0 / dim as f64;
 
-    unsafe {
-        ffi::c_layernorm_forward(
-            batch as i32, dim as i32,
-            xs.as_ptr(),
-            gamma_arr.as_slice().unwrap().as_ptr(),
-            beta_arr.as_slice().unwrap().as_ptr(),
-            eps,
-            ys.as_mut_ptr(),
-        );
-    }
+    // ★ 2-pass: Pass1 = sum + sum_sq → mean/var, Pass2 = normalize
+    ys.par_chunks_mut(dim).enumerate().for_each(|(i, row)| {
+        let offset = i * dim;
+        let mut sx = 0.0f64;
+        let mut sx2 = 0.0f64;
+        for j in 0..dim {
+            let v = xs[offset + j];
+            sx += v;
+            sx2 += v * v;
+        }
+        let mean = sx * inv_dim;
+        let var = sx2 * inv_dim - mean * mean;
+        let inv_std = 1.0 / (var + eps).sqrt();
+        for j in 0..dim {
+            row[j] = gamma_slice[j] * ((xs[offset + j] - mean) * inv_std) + beta_slice[j];
+        }
+    });
     Ok(pyout.into_pyarray(py))
 }
 
