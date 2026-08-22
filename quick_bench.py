@@ -1,6 +1,6 @@
 """
-Quick benchmark — 快速获取所有 25 个测试点的性能数据。
-每项 3 trials, target_time=0.2s, warmup=3。
+Quick benchmark — fast performance data for all 25 test points.
+3 trials per item, target_time=0.2s, warmup=3.
 """
 import os, sys, time, platform
 import numpy as np

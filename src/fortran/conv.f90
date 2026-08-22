@@ -1,5 +1,5 @@
 !==============================================================================
-! ForTeX Convolution — im2col + matmul 策略
+! ForTeX Convolution — im2col + matmul strategy
 !==============================================================================
 module convolution
     use, intrinsic :: iso_fortran_env, only: real64
@@ -10,9 +10,9 @@ module convolution
 contains
 
     !--------------------------------------------------------------------------
-    ! im2col: 将 4D 图像张量 (N, C, H, W) 展开为 2D 矩阵
-    ! 输入: img(C, H, W, N)  — Fortran 列主序
-    ! 输出: col(patch_size, num_patches)
+    ! im2col: unroll 4D image tensor (N, C, H, W) into 2D matrix
+    ! Input: img(C, H, W, N)  — Fortran column-major
+    ! Output: col(patch_size, num_patches)
     !--------------------------------------------------------------------------
     pure subroutine im2col(n, c, h, w, kh, kw, stride_h, stride_w, pad_h, pad_w, img, col)
         integer, intent(in) :: n, c, h, w, kh, kw, stride_h, stride_w, pad_h, pad_w
@@ -29,7 +29,7 @@ contains
         col_row = c * kh * kw
         col_col = out_h * out_w * n
 
-        ! 初始化
+        ! Initialize
         do concurrent (j = 1:col_col)
             do concurrent (i = 1:col_row)
                 col(i, j) = 0.0_real64
@@ -59,9 +59,9 @@ contains
 
     !--------------------------------------------------------------------------
     ! Conv2D Forward: output = Conv(input, weight) + bias
-    ! 输入:  img(C_in, H, W, N)
-    ! 权重: weight(C_out, C_in, Kh, Kw)
-    ! 输出: output(C_out, OutH, OutW, N)
+    ! Input:  img(C_in, H, W, N)
+    ! Weight: weight(C_out, C_in, Kh, Kw)
+    ! Output: output(C_out, OutH, OutW, N)
     !--------------------------------------------------------------------------
     pure subroutine conv2d_forward(n, c_in, c_out, h, w, kh, kw, &
                                     stride_h, stride_w, pad_h, pad_w, &
@@ -89,14 +89,14 @@ contains
         ! im2col
         call im2col(n, c_in, h, w, kh, kw, stride_h, stride_w, pad_h, pad_w, img, col)
 
-        ! 将 weight(C_out, C_in, Kh, Kw) reshape 为 (C_out, patch_size)
+        ! Reshape weight(C_out, C_in, Kh, Kw) to (C_out, patch_size)
         w_reshaped = reshape(weight, [c_out, patch_size])
 
         ! GEMM: out_reshaped = w_reshaped * col
-        ! 用 matmul intrinsic（pure-friendly，编译器映射 BLAS）
+        ! Uses matmul intrinsic (pure-friendly, compiler maps to BLAS)
         out_reshaped = matmul(w_reshaped, col)
 
-        ! 加 bias + reshape 回 (C_out, OutH, OutW, N)
+        ! Add bias + reshape back to (C_out, OutH, OutW, N)
         do batch = 1, n
             do j = 1, out_w
                 do i = 1, out_h

@@ -31,9 +31,9 @@ fn main() {
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
 
     // --- Dependency-ordered source list ---
-    //   avx512_math 必须第一！其他模块 use 它
+    //   avx512_math must be first! Other modules use it
     let sources: Vec<&str> = vec![
-        "avx512_math.f90",  // ★ 必须第一！其他模块 use 它
+        "avx512_math.f90",  // ★ Must be first! Other modules use it
         "blas.f90",
         "activation.f90",
         "loss.f90",
@@ -62,9 +62,9 @@ fn main() {
     // Linux:   .so (auto-linked by Rust)
     // macOS:   .dylib
     //
-    // 命名规范：
-    //   - Windows DLL 必须叫 `fortran_core.dll`（lib.exe 配套 .lib）
-    //   - Linux/macOS 共享库必须叫 `libfortran_core.so/.dylib` 才能被 rustc `-lfortran_core` 找到
+    // Naming convention:
+    //   - Windows DLL must be named `fortran_core.dll` (lib.exe companion .lib)
+    //   - Linux/macOS shared lib must be named `libfortran_core.so/.dylib` for rustc `-lfortran_core` to find
     #[cfg(target_os = "windows")]
     let (lib_filename, link_kind) = ("fortran_core.dll", "fortran_core");
     #[cfg(not(target_os = "windows"))]
@@ -75,22 +75,22 @@ fn main() {
     let mut cmd = Command::new(&gfortran);
     cmd.args(["-shared"]);           // Win→DLL, Linux→.so, mac→.dylib
     cmd.args(["-Ofast", "-fPIC"]);
-    // Linux/macOS: 让共享库自报 SONAME，运行时 dlopen 用 lib 名查找
+    // Linux/macOS: let shared lib declare SONAME, runtime dlopen finds by lib name
     #[cfg(not(target_os = "windows"))]
     cmd.args([format!("-Wl,-soname,{}", lib_filename).as_str()]);
     cmd.args(["-funroll-loops", "-ftree-vectorize"]);
-    // ★ 通用可移植指令集：x86-64-v3 (Haswell 2013+)
-    //   包含 AVX2 + FMA + BMI2，几乎所有 2015 年后的 x86 CPU 都支持。
-    //   编译时无需写手写 intrinsics，让 gfortran 自动生成 SIMD FMA 代码。
-    //   不用 -march=native，因为那会让二进制无法在其他机器跑。
+    // ★ Universal portable ISA: x86-64-v3 (Haswell 2013+)
+    //   Includes AVX2 + FMA + BMI2, supported by almost all x86 CPUs since 2015.
+    //   No hand-written intrinsics needed at compile time; let gfortran auto-generate SIMD FMA code.
+    //   Don't use -march=native, which makes the binary non-portable to other machines.
     cmd.args(["-march=x86-64-v3", "-mtune=generic"]);  // ★ AVX2 + FMA (Haswell+, safe portable)
     cmd.args(["-std=f2018"]);
-    // ★ Round-18: 显式 free-form（避免 gfortran 误判 fixed-form 抑制 sentinel OMP 指令）
+    // ★ Round-18: explicit free-form (avoid gfortran misdetecting fixed-form and suppressing OMP sentinel directives)
     cmd.args(["-ffree-form"]);
-    // OpenMP 多线程
+    // OpenMP multi-threading
     cmd.args(["-fopenmp"]);
-    // ★ math library: -fopenmp-simd 把 exp/log/sqrt 等放进 SIMD reduction
-    //   这样 softmax 的 exp() 和 layernorm 的 sqrt() 会用向量指令
+    // ★ math library: -fopenmp-simd puts exp/log/sqrt etc. into SIMD reduction
+    //   This lets softmax's exp() and layernorm's sqrt() use vector instructions
     cmd.args(["-fopenmp-simd"]);
     // IPO flags within single TU
     cmd.args([
@@ -100,11 +100,11 @@ fn main() {
         "-finline-functions", "-findirect-inlining",
         "-finline-small-functions", "-finline-functions-called-once",
         "-ftree-loop-vectorize", "-ftree-slp-vectorize",
-        "-fvect-cost-model=very-cheap",  // 鼓励 SIMD
+        "-fvect-cost-model=very-cheap",  // Encourage SIMD
     ]);
     // Static-link Fortran runtime:
-    //   - Windows: 需要（避免依赖 gfortran DLL；静态 lib 是 PIC，可链进 DLL）
-    //   - Linux: 不能！Debian/Ubuntu 静态 libgfortran.a 是非 PIC，链进 .so 会失败
+    //   - Windows: needed (avoid depending on gfortran DLL; static lib is PIC, can link into DLL)
+    //   - Linux: cannot! Debian/Ubuntu static libgfortran.a is non-PIC, linking into .so will fail
     #[cfg(target_os = "windows")]
     cmd.args(["-static-libgfortran", "-static-libgcc"]);
     // Export all symbols (Windows: via .def; Linux/macOS: via default linker behaviour)
@@ -136,8 +136,8 @@ fn main() {
 
     cmd.args(["-J", out_dir.to_str().unwrap(),
         "-L", out_dir.to_str().unwrap(),
-        "-l:openblas.dll",                  // ★ 直接链接 DLL（MinGW）
-        "-Wl,--enable-auto-import",         // ★ 允许自动导入
+        "-l:openblas.dll",                  // ★ Direct link DLL (MinGW)
+        "-Wl,--enable-auto-import",         // ★ Allow auto-import
         "-o", lib_path.to_str().unwrap(),
         combined_path.to_str().unwrap(),
     ]);
@@ -177,23 +177,23 @@ fn main() {
     // ★ Round-16: LLVM AVX-512 SIMD (512-bit, 8-wide f64)
     println!("cargo:rustc-env=RUSTFLAGS=-C target-cpu=x86-64-v3");
 
-    // ★★★ Linux 云端：链接 OpenBLAS + 设置 NUMA 亲和性 ★★★
-    // OpenBLAS 会自动选择 per-CPU 最优 GEMM kernel（SKX/ZN 4 等）
+    // ★★★ Linux cloud: link OpenBLAS + set NUMA affinity ★★★
+    // OpenBLAS will auto-select per-CPU optimal GEMM kernel (SKX/ZN 4 etc.)
     if env::consts::OS == "linux" {
-        // gfortran 生成的 Fortran runtime 共享库（libgfortran.so / libgomp.so）
-        //   必须显式告诉 rustc，否则运行时 dlopen 失败
+        // gfortran-generated Fortran runtime shared libraries (libgfortran.so / libgomp.so)
+        //   Must be explicitly told to rustc, otherwise runtime dlopen fails
         println!("cargo:rustc-link-lib=dylib=gfortran");
         println!("cargo:rustc-link-lib=dylib=gomp");
         // OpenBLAS with multithreading (uses OpenMP internally)
         println!("cargo:rustc-link-lib=dylib=openblas");
-        // 环境变量：让 OpenBLAS 绑定线程到物理核心
+        // Environment variables: bind OpenBLAS threads to physical cores
         println!("cargo:rustc-env=OMP_PLACES=cores");
         println!("cargo:rustc-env=OMP_PROC_BIND=close");
         println!("cargo:rustc-env=GOTO_NUM_THREADS={}", num_cpus::get());
         println!("cargo:rustc-env=OPENBLAS_NUM_THREADS={}", num_cpus::get());
-        // 启用 AVX-512 VNNI（Intel Deep Learning Boost）
+        // Enable AVX-512 VNNI (Intel Deep Learning Boost)
         println!("cargo:rustc-env=OPENBLAS_LOOPS=avx512");
-        // OpenBLAS 动态选择最优 kernel
+        // OpenBLAS dynamically selects optimal kernel
         println!("cargo:rustc-env=OPENBLAS_MAIN_FREE=1");
         println!("cargo:rustc-env=OPENBLAS_VERBOSE=0");
     }

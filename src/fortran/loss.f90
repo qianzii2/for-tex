@@ -25,9 +25,9 @@ contains
     end function mse_loss
 
     !--------------------------------------------------------------------------
-    ! Cross Entropy Loss (带 softmax)
-    ! logits: (num_classes, batch) — 列主序: 每列是一个样本的各类别 logits
-    ! targets: (batch) — 整数标签，1-based
+    ! Cross Entropy Loss (with softmax)
+    ! logits: (num_classes, batch) — column-major: each column is one sample's class logits
+    ! targets: (batch) — integer labels, 1-based
     !--------------------------------------------------------------------------
     pure real(real64) function cross_entropy_loss(num_classes, batch, logits, targets) result(loss_val)
         integer, intent(in) :: num_classes, batch
@@ -40,7 +40,7 @@ contains
         loss_val = 0.0_real64
 
         do b = 1, batch
-            ! Softmax — 先找最大值防止溢出
+            ! Softmax — find max first to prevent overflow
             max_val = logits(1, b)
             do i = 2, num_classes
                 if (logits(i, b) > max_val) max_val = logits(i, b)

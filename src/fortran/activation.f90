@@ -1,5 +1,5 @@
 !==============================================================================
-! ForTeX Activation Functions — 全部 elemental 向量化
+! ForTeX Activation Functions — all elemental vectorized
 !==============================================================================
 module activation
     use, intrinsic :: iso_fortran_env, only: real64
@@ -29,7 +29,7 @@ contains
         if (x <= 0.0_real64) grad_x = 0.0_real64
     end function
 
-    ! 批量 ReLU forward (原地)
+    ! Batch ReLU forward (in-place)
     pure subroutine relu_forward(n, x)
         integer, intent(in) :: n
         real(real64), intent(inout) :: x(*)
@@ -39,10 +39,10 @@ contains
         end do
     end subroutine
 
-    ! 批量 GELU forward (out-of-place, OpenMP 并行 + SIMD)
-    ! 用 Padé-style 近似替换 tanh() 库函数，让 gfortran 100% 向量化整个公式：
+    ! Batch GELU forward (out-of-place, OpenMP parallel + SIMD)
+    ! Uses Padé-style approximation to replace tanh() library function, letting gfortran 100% vectorize the entire formula:
     !   tanh(x) ≈ x*(135135+x²(17325+x²(462+x²)))/(135135+x²(3150+x²(28+x²)))   for |x|<9
-    !   误差 < 1e-7, 远超 nn 精度容忍
+    !   Error < 1e-7, far beyond NN precision tolerance
     subroutine gelu_forward(n, x, y)
         integer, intent(in) :: n
         real(real64), intent(in) :: x(*)
@@ -62,9 +62,9 @@ contains
     end subroutine gelu_forward
 
     !--------------------------------------------------------------------------
-    ! Padé [7/8] tanh 近似 — 保证完全 SIMD 化，无库函数调用
+    ! Padé [7/8] tanh approximation — guarantees full SIMD, no library function calls
     !   tanh(x) ≈ x * P(x²) / Q(x²)
-    !   系数来自 Mathematica: PadeApproximant[Tanh[x], {x, 0, {7, 8}}]
+    !   Coefficients from Mathematica: PadeApproximant[Tanh[x], {x, 0, {7, 8}}]
     !--------------------------------------------------------------------------
     real(real64) function tanh_pade(x) result(t)
         real(real64), intent(in) :: x
@@ -78,8 +78,8 @@ contains
     end function tanh_pade
 
     !--------------------------------------------------------------------------
-    ! GELU: x * Phi(x), 其中 Phi 是标准正态 CDF
-    ! 使用 tanh 近似: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+    ! GELU: x * Phi(x), where Phi is the standard normal CDF
+    ! Uses tanh approximation: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
     !--------------------------------------------------------------------------
     elemental real(real64) function gelu(x) result(y)
         real(real64), intent(in) :: x
@@ -112,7 +112,7 @@ contains
     !--------------------------------------------------------------------------
     elemental real(real64) function sigmoid(x) result(y)
         real(real64), intent(in) :: x
-        ! 防止 exp 溢出
+        ! Prevent exp overflow
         if (x >= 0.0_real64) then
             y = 1.0_real64 / (1.0_real64 + exp(-x))
         else
@@ -143,21 +143,21 @@ contains
     end function
 
     !--------------------------------------------------------------------------
-    ! ★ softmax — Round-18: 拆 3 个独立 !$omp parallel do，让 inner SIMD 真正向量化
+    ! ★ softmax — Round-18: split into 3 independent !$omp parallel do, enabling true inner SIMD vectorization
     !
-    ! 根因（gfortran 11.4 报告）：
+    ! Root cause (gfortran 11.4 report):
     !   "softmax: vectorized 0 loops in function"
     !   "missed: statement clobbers memory: __builtin_GOMP_parallel(...)"
     !
-    ! gfortran 行为：当函数被 outer !$omp parallel do 包裹时，
-    !   inner !$omp simd 在嵌套循环里全部被禁用（保守处理 shared/private 别名）。
-    ! 所以原 Round-17 看似 7 个 inner loop 都 SIMD，实际外层 j 的并行让
-    !   inner i 维度的 reduction + simd 都没生效——只有 pass 4 因为没
-    !   reduction 才 64-byte 向量化，pass 1（max）整段串行。
+    ! gfortran behavior: when the function is wrapped by an outer !$omp parallel do,
+    !   inner !$omp simd in nested loops is completely disabled (conservative handling of shared/private aliasing).
+    ! So the original Round-17 appeared to have 7 inner loops all SIMD, but in reality the outer j parallelization
+    !   prevented inner i-dimension reduction + simd from taking effect — only pass 4, which had no reduction,
+    !   achieved 64-byte vectorization; pass 1 (max) was entirely serial.
     !
-    ! 修复：把"4 pass 全在 j parallel do 内"改成"3 个独立 j parallel do"，
-    !   每个 pass 自己的 outer parallel（线程切换代价 ~5μs，pass 1024 行
-    !   每个 100μs+，完全不值一提），inner i 维度现在能正常 SIMD 8x。
+    ! Fix: change "4 passes all within j parallel do" to "3 independent j parallel do",
+    !   each pass with its own outer parallel (thread switch cost ~5μs, vs. 100μs+ per 1024-row pass,
+    !   completely negligible), inner i dimension now properly SIMD 8x.
     !--------------------------------------------------------------------------
     subroutine softmax(n, d, x, y)
         integer, intent(in) :: n, d
@@ -179,7 +179,7 @@ contains
             allocate(shifted(d), stat=alloc_err)
         end if
 
-        ! ★ Pass 1: max per row（独立 parallel do，让 inner SIMD 化）
+        ! ★ Pass 1: max per row (independent parallel do, enabling inner SIMD)
         !$omp parallel do private(j, i, mv) schedule(static)
         do j = 1, n
             mv = x(1, j)
@@ -191,7 +191,7 @@ contains
         end do
         !$omp end parallel do
 
-        ! ★ Pass 2: shift + exp（独立 parallel do，inner shift SIMD 化）
+        ! ★ Pass 2: shift + exp (independent parallel do, inner shift SIMD-ized)
         !$omp parallel do private(j, i) schedule(static)
         do j = 1, n
             !$omp simd
@@ -202,7 +202,7 @@ contains
         end do
         !$omp end parallel do
 
-        ! ★ Pass 3a: sum per row（独立 parallel do，inner SIMD reduction）
+        ! ★ Pass 3a: sum per row (independent parallel do, inner SIMD reduction)
         !$omp parallel do private(j, i, sv) schedule(static)
         do j = 1, n
             sv = 0.0_real64
@@ -214,7 +214,7 @@ contains
         end do
         !$omp end parallel do
 
-        ! ★ Pass 3b: scale（独立 parallel do，inner SIMD）
+        ! ★ Pass 3b: scale (independent parallel do, inner SIMD)
         !$omp parallel do private(j, i) schedule(static)
         do j = 1, n
             !$omp simd

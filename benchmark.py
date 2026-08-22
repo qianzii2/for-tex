@@ -1,19 +1,19 @@
 """
-ForTeX vs PyTorch Benchmark — 业界标准微基准测试
-==================================================
+ForTeX vs PyTorch Benchmark — Industry-standard microbenchmark
+=============================================================
 
-设计参考：
-  - Google Benchmark (C++): 自动校准, min 作为性能指标, 多 repetition
-  - torch.utils.benchmark.Timer: blocked_autorange, min/median 报告
-  - pytest-benchmark: IQR 离群值检测, 统计报告
-  - asv (airspeed-velocity): 峰值性能检测, 多次 warmup
+Design references:
+  - Google Benchmark (C++): auto-calibration, min as performance metric, multiple repetitions
+  - torch.utils.benchmark.Timer: blocked_autorange, min/median reporting
+  - pytest-benchmark: IQR outlier detection, statistical reporting
+  - asv (airspeed-velocity): peak performance detection, multiple warmups
 
-核心原则：
-  1. min 作为"无干扰峰值性能"（排除 OS 调度/中断噪声）
-  2. 自动校准迭代次数（确保每次 trial 足够长，减少 timer 精度影响）
-  3. IQR 离群值检测（仅剔除真正的离群值，不无条件截断）
-  4. PyTorch 对比零额外开销（无 .numpy() 转换，数据预转置）
-  5. 正确性验证前置（smoke test 必须先通过）
+Core principles:
+  1. min as "noise-free peak performance" (excludes OS scheduling/interrupt noise)
+  2. Auto-calibrate iteration count (ensures each trial is long enough, reduces timer precision impact)
+  3. IQR outlier detection (only removes genuine outliers, not unconditional truncation)
+  4. PyTorch comparison with zero extra overhead (no .numpy() conversion, data pre-transposed)
+  5. Correctness verification pre-flight (smoke test must pass first)
 """
 import os
 import sys
@@ -21,7 +21,7 @@ import time
 import platform
 import numpy as np
 
-# ── 环境变量必须在 import for_tex 之前设置 ──────────────────────────
+# ── Environment variables must be set before importing for_tex ──────────────────────────
 os.environ.setdefault("OMP_PROC_BIND", "close")
 os.environ.setdefault("OMP_PLACES", "cores")
 
@@ -34,9 +34,9 @@ import for_tex
 import torch
 
 torch.set_num_threads(NTHREADS)
-torch.set_grad_enabled(False)  # 纯推理模式，零 autograd 开销
+torch.set_grad_enabled(False)  # Pure inference mode, zero autograd overhead
 
-# ── 正确性验证前置 ──────────────────────────────────────────────────
+# ── Correctness verification pre-flight ──────────────────────────────────────────────────
 from test_smoke import run_all_tests
 
 print("=" * 72)
@@ -52,13 +52,13 @@ print("\n[OK] All correctness tests passed. Proceeding to benchmark.\n")
 
 
 # ============================================================================
-# Benchmark 核心函数
+# Benchmark Core Functions
 # ============================================================================
 
 def auto_calibrate(fn, target_time=0.5, min_iters=10, max_iters=500):
     """
-    自动校准迭代次数，使每次 trial 总耗时 >= target_time 秒。
-    参考 torch.utils.benchmark.Timer.blocked_autorange()。
+    Auto-calibrate iteration count so that each trial takes >= target_time seconds.
+    Based on torch.utils.benchmark.Timer.blocked_autorange().
     """
     n_probe = min(min_iters, 10)
     times = []
@@ -75,16 +75,16 @@ def auto_calibrate(fn, target_time=0.5, min_iters=10, max_iters=500):
 
 def bench(fn, warmup=10, trials=7, target_time=0.5):
     """
-    严谨的微基准测试。
+    Rigorous microbenchmark.
 
-    流程：
-      1. 预热 (warmup) — JIT 编译、cache 预热
-      2. 自动校准迭代次数
-      3. trials 次独立 trial，每次取 min（Google Benchmark 标准）
-      4. IQR 离群值检测 — 仅剔除受 OS 严重干扰的 trial
-      5. 报告 min/median/mean±std
+    Process:
+      1. Warmup — JIT compilation, cache warmup
+      2. Auto-calibrate iteration count
+      3. trials independent trials, each taking min (Google Benchmark standard)
+      4. IQR outlier detection — only removes trials severely affected by OS noise
+      5. Report min/median/mean±std
 
-    返回: dict {'min','median','mean','std','n_trials','n_iters','unit'}
+    Returns: dict {'min','median','mean','std','n_trials','n_iters','unit'}
     """
     for _ in range(warmup):
         fn()
@@ -98,11 +98,11 @@ def bench(fn, warmup=10, trials=7, target_time=0.5):
             t0 = time.perf_counter()
             fn()
             times.append(time.perf_counter() - t0)
-        trial_mins.append(min(times))  # ★ 每次 trial 取 min
+        trial_mins.append(min(times))  # ★ Take min per trial
 
     trial_mins = np.array(trial_mins) * 1000.0
 
-    # IQR 离群值检测（仅当有足够方差时）
+    # IQR outlier detection (only when variance is sufficient)
     if len(trial_mins) >= 5 and np.std(trial_mins) > 0:
         q1, q3 = np.percentile(trial_mins, 25), np.percentile(trial_mins, 75)
         iqr = q3 - q1
@@ -124,12 +124,12 @@ def bench(fn, warmup=10, trials=7, target_time=0.5):
 
 
 def speedup(ft_result, pt_result):
-    """Speedup = PyTorch_min / ForTeX_min。> 1.0 表示 ForTeX 更快。"""
+    """Speedup = PyTorch_min / ForTeX_min. > 1.0 means ForTeX is faster."""
     return pt_result['min'] / ft_result['min']
 
 
 def verdict(sp, tight=False):
-    """将 speedup 转为人类可读标签。"""
+    """Convert speedup to human-readable label."""
     t = 1.02 if tight else 1.05
     if sp > t:
         return "WIN"
@@ -140,7 +140,7 @@ def verdict(sp, tight=False):
 
 
 # ============================================================================
-# 格式化输出
+# Formatted Output
 # ============================================================================
 
 def print_header():
@@ -166,7 +166,7 @@ def fmt_time(ms):
 
 
 def print_table(title, rows):
-    """打印 benchmark 对比表格。"""
+    """Print benchmark comparison table."""
     print(f"\n{'─'*72}")
     print(f"  {title}")
     print(f"{'─'*72}")
@@ -183,13 +183,13 @@ def print_table(title, rows):
 
 
 # ============================================================================
-# 各算子 Benchmark
+# Per-Operator Benchmarks
 # ============================================================================
 
 def bench_gemm():
     """GEMM (DGEMM)"""
     print("\n" + "=" * 72)
-    print("  1. GEMM (DGEMM) — 矩阵乘法")
+    print("  1. GEMM (DGEMM) — Matrix Multiplication")
     print("=" * 72)
     print("  ForTeX: K-blocked GEMM (Fortran)")
     print("  PyTorch: torch.matmul → MKL")
@@ -238,8 +238,8 @@ def bench_linear_relu():
     print("\n" + "=" * 72)
     print("  3. Fused Linear+ReLU")
     print("=" * 72)
-    print("  ForTeX: matmul + bias + ReLU 一次内存遍历")
-    print("  PyTorch: F.linear + relu 两个独立 kernel")
+    print("  ForTeX: matmul + bias + ReLU single memory traversal")
+    print("  PyTorch: F.linear + relu two separate kernels")
 
     configs = [(512,1024,512,"512×1024×512"), (1024,4096,1024,"1024×4096×1024")]
     rows = []
@@ -247,7 +247,7 @@ def bench_linear_relu():
         weight = np.random.randn(m, k)
         bias = np.random.randn(m)
         x = np.random.randn(k, n)
-        x_pt = torch.from_numpy(x.T.copy())  # 预转置，避免 lambda 内 .T 开销
+        x_pt = torch.from_numpy(x.T.copy())  # Pre-transpose, avoid .T overhead in lambda
         w_pt = torch.from_numpy(weight)
         b_pt = torch.from_numpy(bias)
         ft = bench(lambda w=weight, b=bias, x=x: for_tex.linear_relu(w, b, x))
@@ -264,7 +264,7 @@ def bench_conv2d():
     print("\n" + "=" * 72)
     print("  4. Conv2D")
     print("=" * 72)
-    print("  ForTeX: 直卷积（4 重循环，零拷贝，编译器 SIMD）")
+    print("  ForTeX: Direct convolution (4 nested loops, zero-copy, compiler SIMD)")
     print("  PyTorch: F.conv2d → oneDNN")
 
     configs = [
@@ -350,9 +350,9 @@ def bench_layernorm():
 def bench_gelu():
     """GELU"""
     print("\n" + "=" * 72)
-    print("  7. GELU 激活")
+    print("  7. GELU Activation")
     print("=" * 72)
-    print("  ForTeX: Padé [7/8] 近似 tanh, 完全 SIMD 化")
+    print("  ForTeX: Padé [7/8] approximation of tanh, fully SIMD-ized")
     print("  PyTorch: F.gelu → MKL (libm tanh)")
 
     configs = [((512,512),"512×512"), ((2048,2048),"2048×2048"), ((4096,4096),"4096×4096")]
@@ -370,7 +370,7 @@ def bench_gelu():
 
 
 # ============================================================================
-# 汇总
+# Summary
 # ============================================================================
 
 def print_summary(all_results):
@@ -413,7 +413,7 @@ def print_summary(all_results):
 
 
 # ============================================================================
-# 主入口
+# Main Entry
 # ============================================================================
 
 if __name__ == "__main__":
@@ -421,7 +421,7 @@ if __name__ == "__main__":
 
     all_results = []
 
-    # 为每个结果附加 group 标签
+    # Attach group label to each result
     def tag(group, rows):
         for r in rows:
             r['group'] = group

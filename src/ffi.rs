@@ -1,14 +1,14 @@
 //! FFI bindings to Fortran library
 
 extern "C" {
-    // ★ 零拷贝 GEMM — 直接传行主序指针
+    // ★ Zero-copy GEMM — pass row-major pointers directly
     pub fn c_rowmajor_gemm(
         m: i32, n: i32, k: i32,
         a: *const f64,
         b: *const f64,
         c: *mut f64,
     );
-    // ★ 零拷贝 Fused Linear+ReLU
+    // ★ Zero-copy Fused Linear+ReLU
     pub fn c_rowmajor_fused_linear_relu(
         m: i32, n: i32, k: i32,
         weight: *const f64,
@@ -16,7 +16,7 @@ extern "C" {
         x: *const f64,
         y: *mut f64,
     );
-    // ★ Fortran matmul() 内建
+    // ★ Fortran matmul() built-in
     pub fn c_simple_gemm(
         m: i32, n: i32, k: i32,
         a: *const f64,

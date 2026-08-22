@@ -1,6 +1,6 @@
 !==============================================================================
-! ForTeX BLAS — 纯 Fortran 2018 实现的 BLAS Level 1/2/3
-! 特性: pure, elemental, do concurrent, 手工分块 GEMM
+! ForTeX BLAS — Pure Fortran 2018 implementation of BLAS Level 1/2/3
+! Features: pure, elemental, do concurrent, hand-tiled GEMM
 !==============================================================================
 module blas
     use, intrinsic :: iso_fortran_env, only: real64, int64
@@ -10,7 +10,7 @@ module blas
     public :: simple_gemm, fused_linear_relu
 
     ! Tiling parameters for GEMM (tuned for AVX-512 L1/L2 cache sizes)
-    ! Round-17: 更大块 → 更好 cache 复用 → 更少 miss
+    ! Round-17: larger blocks → better cache reuse → fewer misses
     integer, parameter :: BLOCK_M = 72
     integer, parameter :: BLOCK_N = 240
     integer, parameter :: BLOCK_K = 512
@@ -18,7 +18,7 @@ module blas
 contains
 
     !--------------------------------------------------------------------------
-    ! AXPY: Y = alpha * X + Y  — elemental 让编译器自动向量化
+    ! AXPY: Y = alpha * X + Y  — elemental lets compiler auto-vectorize
     !--------------------------------------------------------------------------
     pure subroutine daxpy(n, alpha, x, incx, y, incy)
         integer, intent(in) :: n
@@ -39,7 +39,7 @@ contains
     end subroutine daxpy
 
     !--------------------------------------------------------------------------
-    ! DOT: sum(X * Y) — 利用 Fortran 内建 dot_product 的极致优化
+    ! DOT: sum(X * Y) — leverages Fortran built-in dot_product's extreme optimization
     !--------------------------------------------------------------------------
     pure real(real64) function ddot(n, x, incx, y, incy) result(res)
         integer, intent(in) :: n
@@ -49,7 +49,7 @@ contains
 
         res = 0.0_real64
         if (incx == 1 .and. incy == 1) then
-            ! 连续内存 — 编译器可以生成 AVX-512 指令
+            ! Contiguous memory — compiler can generate AVX-512 instructions
             do concurrent (i = 1:n)
                 res = res + x(i) * y(i)
             end do
@@ -123,14 +123,14 @@ contains
     end subroutine dgemv
 
     !--------------------------------------------------------------------------
-    ! ★ GEMM: C = alpha * A * B + beta * C  — 手工分块 + 寄存器复用
+    ! ★ GEMM: C = alpha * A * B + beta * C  — hand-tiled + register reuse
     !
-    ! Round-17 关键优化：
-    !   - BLOCK_M=72 BLOCK_N=240 BLOCK_K=512 （更大块，更好 cache 复用）
-    !   - 内层循环 !$omp simd 强制 AVX-512 FMA 链
-    !   - 编译器会把 i-loop 映射成 zmm 8-wide
+    ! Round-17 key optimizations:
+    !   - BLOCK_M=72 BLOCK_N=240 BLOCK_K=512 (larger blocks, better cache reuse)
+    !   - Inner loop !$omp simd forces AVX-512 FMA chain
+    !   - Compiler maps i-loop to zmm 8-wide
     !
-    ! 注意：不能用 pure（pure 不允许 !$omp parallel）
+    ! Note: cannot use pure (pure disallows !$omp parallel)
     !--------------------------------------------------------------------------
     subroutine dgemm(transa, transb, m, n, k, alpha, a, lda, b, ldb, beta, c, ldc)
         character, intent(in) :: transa, transb
@@ -157,7 +157,7 @@ contains
         end do
         !$omp end parallel do
 
-        ! Outer 6 重分块循环
+        ! Outer 6-nested tiling loops
         !$omp parallel do private(i0, j0, l0, i1, j1, l1, l, j, i, a_val) schedule(static)
         do i0 = 1, m, BLOCK_M
             do j0 = 1, n, BLOCK_N
@@ -199,23 +199,23 @@ contains
     end subroutine dgemm
 
     !--------------------------------------------------------------------------
-    ! ★ simple_gemm — 用 Fortran 内建 matmul() 一行搞定
-    !   编译器直接映射到 AVX-512 FMA。无需手写 SIMD intrinsics。
-    !   作为 baseline，用来对比手工 GEMM 的加速比。
+    ! ★ simple_gemm — one-liner using Fortran built-in matmul()
+    !   Compiler directly maps to AVX-512 FMA. No hand-written SIMD intrinsics needed.
+    !   As baseline, compared against hand-tiled GEMM speedup.
     !--------------------------------------------------------------------------
     pure function simple_gemm(a, b) result(c)
         real(real64), intent(in) :: a(:,:), b(:,:)
         real(real64) :: c(size(a,1), size(b,2))
-        ! matmul 是 Fortran 语言内建，编译器对它做了几十年优化
+        ! matmul is a Fortran language built-in, compilers have optimized it for decades
         c = matmul(a, b)
     end function simple_gemm
 
     !--------------------------------------------------------------------------
-    ! ★ fused_linear_relu — 算子融合：matmul + bias + ReLU 一次遍历
+    ! ★ fused_linear_relu — operator fusion: matmul + bias + ReLU in one pass
     !
-    ! Round-17 关键优化：把"relu"拆成 SIMD 单独循环（编译器更容易生成 vmaxpd）
+    ! Round-17 key optimization: split "relu" into separate SIMD loop (compiler generates vmaxpd more easily)
     !
-    ! PyTorch 的 fused linear+relu 走 cuDNN；这里纯 CPU 实现要做到 0 开销激活。
+    ! PyTorch's fused linear+relu uses cuDNN; here pure CPU implementation achieves 0-overhead activation.
     !--------------------------------------------------------------------------
     subroutine fused_linear_relu(m, n, k, weight, bias, x, y)
         integer, intent(in) :: m, n, k
@@ -225,11 +225,11 @@ contains
 
         !$omp parallel do private(i, j) schedule(static)
         do j = 1, n
-            ! matmul + bias 一次性融合（编译器生成 FMA chain）
+            ! matmul + bias fused in one step (compiler generates FMA chain)
             do i = 1, m
                 y(i, j) = sum(weight(i, :) * x(:, j)) + bias(i)
             end do
-            ! ReLU: 显式 max 让编译器生成 vmaxpd(0, y)，而不是 where
+            ! ReLU: explicit max lets compiler generate vmaxpd(0, y), not where
             !$omp simd
             do i = 1, m
                 if (y(i, j) < 0.0_real64) y(i, j) = 0.0_real64

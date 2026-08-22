@@ -1,15 +1,15 @@
 """
-ForTeX 正确性验证 — 带断言的 smoke test。
-可独立运行 (`python test_smoke.py`)，也可被 benchmark 导入。
+ForTeX Correctness Verification — Smoke test with asserts.
+Can run standalone (`python test_smoke.py`) or be imported by benchmark.
 """
 import sys
 import numpy as np
 
-# 固定 seed，确保可复现
+# Fixed seed for reproducibility
 SEED = 42
 
 def run_all_tests() -> int:
-    """运行全部正确性测试。返回 0 表示全部通过，非 0 表示失败。"""
+    """Run all correctness tests. Returns 0 if all pass, non-zero on failure."""
     np.random.seed(SEED)
 
     import for_tex as ft
@@ -86,11 +86,11 @@ def run_all_tests() -> int:
 
 
 # ============================================================================
-# 测试实现
+# Test Implementations
 # ============================================================================
 
 def _test_gemm(fn, name: str):
-    """GEMM: C = A @ B, 验证与 NumPy reference 一致。"""
+    """GEMM: C = A @ B, verify against NumPy reference."""
     a = np.random.randn(128, 256)
     b = np.random.randn(256, 512)
     c = fn(a, b)
@@ -116,14 +116,14 @@ def _test_linear_relu(ft):
     np.testing.assert_allclose(y, ref, rtol=1e-10, atol=1e-10)
 
 def _test_activation(ft_fn, ref_fn):
-    """逐元素激活函数：验证与 reference 一致。"""
+    """Element-wise activation function: verify against reference."""
     x = np.random.randn(2000)
     y = ft_fn(x)
     ref = ref_fn(x)
     np.testing.assert_allclose(y, ref, rtol=1e-6, atol=1e-6)
 
 def _test_gelu(ft):
-    """GELU: 使用 Padé 近似 tanh，容差放宽到 1e-5。"""
+    """GELU: Uses Padé approximation of tanh, tolerance relaxed to 1e-5."""
     x = np.random.randn(2000)
     y = ft.gelu(x)
     # PyTorch-style GELU tanh approximation
@@ -134,28 +134,28 @@ def _test_gelu(ft):
         err_msg=f"GELU Padé vs tanh: max diff {np.max(np.abs(y - ref)):.1e}")
 
 def _test_softmax(ft):
-    """Softmax: 验证 row sum = 1 且数值与 PyTorch reference 一致。"""
+    """Softmax: verify row sum = 1 and values match PyTorch reference."""
     try:
         import torch
         x = np.random.randn(64, 128)
         y = ft.softmax_fn(x)
-        # row sum 必须为 1
+        # Row sums must equal 1
         sums = y.sum(axis=1)
         np.testing.assert_allclose(sums, np.ones(64), rtol=1e-12, atol=1e-12,
             err_msg=f"Softmax row sums: max err {np.max(np.abs(sums - 1)):.1e}")
-        # 验证数值
+        # Verify values
         ref = torch.softmax(torch.from_numpy(x), dim=-1).numpy()
         np.testing.assert_allclose(y, ref, rtol=2e-2, atol=2e-2,
             err_msg=f"Softmax vs PyTorch: max diff {np.max(np.abs(y - ref)):.1e}")
     except ImportError:
-        # 如果没有 PyTorch，只验证 row sum
+        # Without PyTorch, only verify row sums
         x = np.random.randn(64, 128)
         y = ft.softmax_fn(x)
         sums = y.sum(axis=1)
         np.testing.assert_allclose(sums, np.ones(64), rtol=1e-12, atol=1e-12)
 
 def _test_conv2d(ft, stride, padding):
-    """Conv2D: 验证与 PyTorch reference 一致。"""
+    """Conv2D: verify against PyTorch reference."""
     try:
         import torch
         n, ci, co, h, w = 2, 3, 16, 32, 32
@@ -176,7 +176,7 @@ def _test_conv2d(ft, stride, padding):
         np.testing.assert_allclose(out, ref, rtol=1e-10, atol=1e-10,
             err_msg=f"Conv2D s={stride} p={padding}: max diff {np.max(np.abs(out - ref)):.1e}")
     except ImportError:
-        # 无 PyTorch：仅验证 shape 和数值范围
+        # No PyTorch: only verify shape and value range
         n, ci, co, h, w = 2, 3, 16, 32, 32
         img = np.random.randn(n, ci, h, w)
         weight = np.random.randn(co, ci, 3, 3)
@@ -188,7 +188,7 @@ def _test_conv2d(ft, stride, padding):
         assert np.isfinite(out).all(), "Conv2D output contains NaN/Inf"
 
 def _test_maxpool(ft):
-    """MaxPool2D: 验证与 PyTorch reference 一致。"""
+    """MaxPool2D: verify against PyTorch reference."""
     try:
         import torch
         x = np.random.randn(2, 8, 28, 28)
@@ -202,7 +202,7 @@ def _test_maxpool(ft):
         assert np.isfinite(out).all(), "MaxPool output contains NaN/Inf"
 
 def _test_avgpool(ft):
-    """AvgPool2D: 验证与 PyTorch reference 一致。"""
+    """AvgPool2D: verify against PyTorch reference."""
     try:
         import torch
         x = np.random.randn(2, 8, 28, 28)
@@ -216,7 +216,7 @@ def _test_avgpool(ft):
         assert np.isfinite(out).all(), "AvgPool output contains NaN/Inf"
 
 def _test_layernorm(ft):
-    """LayerNorm: 验证 mean≈0, std≈1 且与 PyTorch reference 一致。"""
+    """LayerNorm: verify mean≈0, std≈1 and match PyTorch reference."""
     try:
         import torch
         batch, dim = 16, 128
@@ -230,7 +230,7 @@ def _test_layernorm(ft):
         np.testing.assert_allclose(y_no_affine.mean(), 0.0, atol=1e-6,
             err_msg=f"LayerNorm mean: {y_no_affine.mean():.1e}")
 
-        # 验证数值
+        # Verify values
         ref = torch.nn.functional.layer_norm(
             torch.from_numpy(x), (dim,),
             torch.from_numpy(gamma), torch.from_numpy(beta),
@@ -246,7 +246,7 @@ def _test_layernorm(ft):
         assert np.isfinite(y).all(), "LayerNorm output contains NaN/Inf"
 
 def _test_mse(ft):
-    """MSE: 验证与 NumPy reference 一致。"""
+    """MSE: verify against NumPy reference."""
     y_pred = np.random.randn(100)
     y_true = np.random.randn(100)
     loss = ft.mse(y_pred, y_true)
@@ -254,7 +254,7 @@ def _test_mse(ft):
     np.testing.assert_allclose(loss, ref, rtol=1e-10, atol=1e-10)
 
 def _test_cross_entropy(ft):
-    """Cross Entropy: 验证与 PyTorch reference 一致。"""
+    """Cross Entropy: verify against PyTorch reference."""
     try:
         import torch
         batch, classes = 16, 10
@@ -277,7 +277,7 @@ def _test_cross_entropy(ft):
 
 
 # ============================================================================
-# 入口
+# Entry
 # ============================================================================
 if __name__ == "__main__":
     sys.exit(run_all_tests())

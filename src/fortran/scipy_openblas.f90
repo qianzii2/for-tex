@@ -1,5 +1,5 @@
 !==============================================================================
-! scipy OpenBLAS wrapper — 调用 scipy 自带的 OpenBLAS
+! scipy OpenBLAS wrapper — calls scipy's bundled OpenBLAS
 !==============================================================================
 module scipy_openblas
     use, intrinsic :: iso_c_binding
@@ -29,7 +29,7 @@ contains
 
     !--------------------------------------------------------------------------
     ! Row-major GEMM: C(m,n) = A(m,k) @ B(k,n)
-    ! 利用零拷贝转置恒等式：C^T = B^T @ A^T (col-major = row-major)
+    ! Uses zero-copy transpose identity: C^T = B^T @ A^T (col-major = row-major)
     !--------------------------------------------------------------------------
     subroutine scipy_dgemm(m, n, k, a, b, c)
         integer, intent(in) :: m, n, k
@@ -45,7 +45,7 @@ contains
     end subroutine scipy_dgemm
 
     !--------------------------------------------------------------------------
-    ! 通用 GEMM: C = A @ B (column-major, NoTrans)
+    ! Generic GEMM: C = A @ B (column-major, NoTrans)
     !--------------------------------------------------------------------------
     subroutine scipy_dgemm_generic(m, n, k, a, lda, b, ldb, c, ldc)
         integer, intent(in) :: m, n, k, lda, ldb, ldc

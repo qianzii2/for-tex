@@ -16,9 +16,9 @@ contains
 
     !========== GEMM ==========
     !--------------------------------------------------------------------------
-    ! ★ simple_gemm — Fortran 内建 matmul() 包装
-    !   一行代码，编译器自动 AVX-512 FMA。
-    !   和手工六重分块 GEMM 对比，展示"编译器比你聪明"和"你能比编译器聪明"
+    ! ★ simple_gemm — Fortran built-in matmul() wrapper
+    !   One line of code, compiler auto AVX-512 FMA.
+    !   Compare with hand-tiled six-nested GEMM, showcasing "compiler is smarter than you" and "you can be smarter than the compiler"
     !--------------------------------------------------------------------------
     subroutine c_simple_gemm(m, n, k, a, b, c) bind(c, name="c_simple_gemm")
         integer(c_int), value :: m, n, k
@@ -28,28 +28,28 @@ contains
     end subroutine c_simple_gemm
 
     !--------------------------------------------------------------------------
-    ! ★★ 零拷贝 GEMM — 直接接收行主序数据，利用转置恒等式
-    !   C(m,n) = A(m,k) @ B(k,n)       [行主序]
-    !   C^T(n,m) = B^T(n,k) @ A^T(k,m) [列主序]
-    !   行主序内存 == 列主序转置的内存。直接传指针！
-    !   a 声明为 (k,m) → Fortran 看到的是 A^T
-    !   b 声明为 (n,k) → Fortran 看到的是 B^T
-    !   c 声明为 (n,m) → Fortran 写入 C^T = 行主序 C
+    ! ★★ Zero-copy GEMM — directly receives row-major data, using transpose identity
+    !   C(m,n) = A(m,k) @ B(k,n)       [row-major]
+    !   C^T(n,m) = B^T(n,k) @ A^T(k,m) [column-major]
+    !   Row-major memory == column-major transposed memory. Pass pointers directly!
+    !   a declared as (k,m) → Fortran sees A^T
+    !   b declared as (n,k) → Fortran sees B^T
+    !   c declared as (n,m) → Fortran writes C^T = row-major C
     !--------------------------------------------------------------------------
     !--------------------------------------------------------------------------
-    ! ★★★ Round-6 GEMM: 2D 分块并行 + matmul() 内建（编译器级 SIMD）
-    !   策略：
-    !     - 外层 2D 分块并行（ii in m, jj in n），每个线程处理一个 (m-tile, n-tile)
-    !     - 内层用 matmul() 调内置 BLAS-quality GEMM (gfortran 把它编成 AVX2 FMA)
-    !     - 关键：matmul(a,b) 其中 a(k,n_tile), b(k,m_tile) 是行连续的！
-    !       因为 weight^T 列主序 = 内存中 weight(m,k) 行连续, matmul 内部会展开成
-    !       对 a 的 k 维 stride-1 访问 + 对 b 的 k 维 stride-1 访问 → SIMD 友好
+    ! ★★★ Round-6 GEMM: 2D tiled parallel + matmul() built-in (compiler-level SIMD)
+    !   Strategy:
+    !     - Outer 2D tiled parallel (ii in m, jj in n), each thread handles one (m-tile, n-tile)
+    !     - Inner uses matmul() to call built-in BLAS-quality GEMM (gfortran compiles to AVX2 FMA)
+    !     - Key: matmul(a,b) where a(k,n_tile), b(k,m_tile) is row-contiguous!
+    !       Because weight^T column-major = weight(m,k) row-contiguous in memory, matmul internally unrolls into
+    !       stride-1 access on a's k dimension + stride-1 access on b's k dimension → SIMD-friendly
     !--------------------------------------------------------------------------
     subroutine c_rowmajor_gemm(m, n, k, a, b, c) bind(c, name="c_rowmajor_gemm")
         integer(c_int), value :: m, n, k
-        real(c_double), intent(in) :: a(k, m)   ! A^T 列主序 = A(m,k) 行连续
-        real(c_double), intent(in) :: b(n, k)   ! B^T 列主序 = B(k,n) 行连续
-        real(c_double), intent(out) :: c(n, m)  ! C^T 列主序 = C(m,n) 行连续
+        real(c_double), intent(in) :: a(k, m)   ! A^T col-major = A(m,k) row-contiguous
+        real(c_double), intent(in) :: b(n, k)   ! B^T col-major = B(k,n) row-contiguous
+        real(c_double), intent(out) :: c(n, m)  ! C^T col-major = C(m,n) row-contiguous
         integer :: ii, jj, im, jm
         integer, parameter :: MB = 96, NB = 128  ! unused
 
@@ -57,23 +57,23 @@ contains
     end subroutine c_rowmajor_gemm
 
     !--------------------------------------------------------------------------
-    ! ★★ 零拷贝 Fused Linear+ReLU
-    !   weight(m,k) 行主序 → weight^T(k,m) 列主序
-    !   x(k,n) 行主序 → x^T(n,k) 列主序
-    !   y(m,n) 行主序 → y^T(n,m) 列主序
+    ! ★★ Zero-copy Fused Linear+ReLU
+    !   weight(m,k) row-major → weight^T(k,m) column-major
+    !   x(k,n) row-major → x^T(n,k) column-major
+    !   y(m,n) row-major → y^T(n,m) column-major
     !   y = relu(W @ x + bias)
-    !   y^T(:,j) = x^T @ W^T(:,j) + bias(j)  (每列 j = 每行 j-1)
+    !   y^T(:,j) = x^T @ W^T(:,j) + bias(j)  (each column j = each row j-1)
     !--------------------------------------------------------------------------
     subroutine c_rowmajor_fused_linear_relu(m, n, k, weight, bias, x, y) &
         bind(c, name="c_rowmajor_fused_linear_relu")
         integer(c_int), value :: m, n, k
-        real(c_double), intent(in) :: weight(k, m)  ! W^T 列主序
+        real(c_double), intent(in) :: weight(k, m)  ! W^T col-major
         real(c_double), intent(in) :: bias(m)
-        real(c_double), intent(in) :: x(n, k)        ! X^T 列主序
-        real(c_double), intent(out) :: y(n, m)       ! Y^T 列主序 = Y 行主序
+        real(c_double), intent(in) :: x(n, k)        ! X^T col-major
+        real(c_double), intent(out) :: y(n, m)       ! Y^T col-major = Y row-major
         integer :: i, j
-        ! 策略：先并行 matmul，然后 fused bias + ReLU
-        ! matmul 已是 BLAS-优化，由 gfortran 转为高效 SIMD
+        ! Strategy: parallel matmul first, then fused bias + ReLU
+        ! matmul is already BLAS-optimized, converted to efficient SIMD by gfortran
         call scipy_dgemm_generic(n, m, k, x, n, weight, k, y, n)
         !$omp parallel do collapse(2) private(i, j) schedule(static)
         do j = 1, m
@@ -85,7 +85,7 @@ contains
     end subroutine c_rowmajor_fused_linear_relu
 
     !--------------------------------------------------------------------------
-    ! ★★ 零拷贝 Conv2D — im2col + matmul 策略
+    ! ★★ Zero-copy Conv2D — im2col + matmul strategy
     !   img: (n, c_in, h, w) row-major = (w, h, c_in, n) column-major
     !   weight: (c_out, c_in, kh, kw) row-major = (kw, kh, c_in, c_out) col-major
     !   output: (n, c_out, out_h, out_w) row-major = (out_w, out_h, c_out, n) col-major
@@ -109,9 +109,9 @@ contains
 
         allocate(col(patch_size, num_patches))
         allocate(out_col(c_out, num_patches))
-        col = 0.0_c_double  ! ★ 必须清零：padding 位置不写入
+        col = 0.0_c_double  ! ★ Must zero: padding positions are not written
 
-        ! ── im2col: 自适应 OpenMP ──
+        ! ── im2col: adaptive OpenMP ──
         if (num_patches > 1024) then
             !$omp parallel do collapse(3) private(b, oh, ow, ci, ki, kj, ix, iy, pe, pi, ki_min, ki_max, kj_min, kj_max) &
             !$omp schedule(static)
@@ -228,7 +228,7 @@ contains
         real(c_double) :: sx, sx2, mean_val, var_val, inv_std, inv_dim
         inv_dim = 1.0_c_double / dim
 
-        ! ★ 2-pass: 融合 sum+sum_sq 减少内存遍历
+        ! ★ 2-pass: fused sum+sum_sq reduces memory traversal
         !$omp parallel do private(b, i, sx, sx2, mean_val, var_val, inv_std) schedule(static)
         do b = 1, batch
             ! Pass 1: sum + sum_sq (fused, 1 memory traversal)

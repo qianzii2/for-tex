@@ -1,9 +1,9 @@
-//! ForTeX — Rust调度层: PyO3 + rayon + FFI
+//! ForTeX — Rust scheduling layer: PyO3 + rayon + FFI
 //!
-//! 职责：
-//! 1. FFI 绑定 Fortran 数值算子
-//! 2. 线程池（rayon）
-//! 3. PyO3 Python 绑定
+//! Responsibilities:
+//! 1. FFI bindings to Fortran numerical operators
+//! 2. Thread pool (rayon)
+//! 3. PyO3 Python bindings
 
 mod ffi;
 
@@ -17,7 +17,7 @@ use numpy::ndarray::{ArrayD, Array1, Array2, Array4};
 use rayon::prelude::*;
 
 // ============================================================================
-// Activation 内联函数（在 Rust 侧做逐元素操作，保持 Fortran 做重活）
+// Activation inline functions (element-wise ops in Rust, Fortran does heavy work)
 // ============================================================================
 mod activation {
     #[inline(always)]
@@ -62,7 +62,7 @@ fn for_tex(m: &Bound<'_, PyModule>) -> PyResult<()> {
 }
 
 // ============================================================================
-// GEMM — 调用 Fortran matmul() 内建（已验证正确）
+// GEMM — Calls Fortran matmul() built-in (verified correct)
 // ============================================================================
 
 #[pyfunction]
@@ -88,7 +88,7 @@ fn gemm<'py>(
     let k = k_a;
 
     if !ta && !tb {
-        // ★ 零拷贝快路径：C = A@B 行主序 ⟺ C^T = B^T@A^T 列主序
+        // ★ Zero-copy fast path: C = A@B row-major ⟺ C^T = B^T@A^T column-major
         let mut pyout = Array2::zeros((m, n));
         let c_slice = pyout.as_slice_mut().unwrap();
         unsafe {
@@ -97,7 +97,7 @@ fn gemm<'py>(
         }
         Ok(pyout.into_pyarray(py))
     } else {
-        // 回退：转置情况需手工处理
+        // Fallback: transpose case requires manual handling
         let mut a_f = vec![0.0f64; m * k];
         if ta {
             for i in 0..m { for j in 0..k { a_f[i + j * m] = a_slice[j * k + i]; }}
@@ -122,7 +122,7 @@ fn gemm<'py>(
 }
 
 // ============================================================================
-// GEMV — y = A @ x, 通过 gemm(x.reshape(n,1)) 实现
+// GEMV — y = A @ x, implemented via gemm(x.reshape(n,1))
 // ============================================================================
 
 #[pyfunction]
@@ -138,7 +138,7 @@ fn gemv<'py>(
     let a_slice = a_arr.as_slice().unwrap();
     let x_slice = x_arr.as_slice().unwrap();
 
-    // ★ 零拷贝：y(m) = A(m,n)@x(n) 行主序 ⟺ y^T(1,m) = x^T(1,n)@A^T(n,m) 列主序
+    // ★ Zero-copy: y(m) = A(m,n)@x(n) row-major ⟺ y^T(1,m) = x^T(1,n)@A^T(n,m) column-major
     let mut pyout = Array1::zeros(m);
     let y_slice = pyout.as_slice_mut().unwrap();
     unsafe {
@@ -149,7 +149,7 @@ fn gemv<'py>(
 }
 
 // ============================================================================
-// simple_gemm — Fortran matmul() 内建，一行  vs 六重分块手工 GEMM
+// simple_gemm — Fortran matmul() built-in, one-liner vs six-nested-block hand GEMM
 // ============================================================================
 
 #[pyfunction]
@@ -168,7 +168,7 @@ fn simple_gemm<'py>(
     let a_slice = a.as_slice().unwrap();
     let b_slice = b.as_slice().unwrap();
 
-    // ★ 零拷贝：直接传行主序指针
+    // ★ Zero-copy: pass row-major pointers directly
     let mut pyout = Array2::zeros((m, n));
     let c_slice = pyout.as_slice_mut().unwrap();
     unsafe {
@@ -214,7 +214,7 @@ fn linear_relu<'py>(
 }
 
 // ============================================================================
-// Activation Functions — 逐元素操作，rayon 并行
+// Activation Functions — element-wise ops, rayon parallel
 // ============================================================================
 
 macro_rules! element_wise {
@@ -243,7 +243,7 @@ element_wise!(relu, activation::relu, "ReLU activation");
 element_wise!(sigmoid, activation::sigmoid, "Sigmoid activation");
 element_wise!(tanh_fn, activation::tanh_act, "Tanh activation");
 
-// GELU: 小矩阵走 Rust scalar（避免 OMP 线程开销），大矩阵走 Fortran OMP+SIMD
+// GELU: small matrices use Rust scalar (avoid OMP thread overhead), large use Fortran OMP+SIMD
 #[pyfunction]
 fn gelu<'py>(
     py: Python<'py>,
@@ -256,13 +256,13 @@ fn gelu<'py>(
     let ys = pyout.as_slice_mut().unwrap();
 
     if n < 262144 {
-        // 小矩阵：Rust scalar（rayon 并行，无 OMP 开销）
+        // Small matrices: Rust scalar (rayon parallel, no OMP overhead)
         use activation::gelu as gelu_scalar;
         ys.par_iter_mut().enumerate().for_each(|(i, v)| {
             *v = gelu_scalar(xs[i]);
         });
     } else {
-        // 大矩阵：Fortran OMP + SIMD Padé tanh
+        // Large matrices: Fortran OMP + SIMD Padé tanh
         unsafe {
             ffi::c_gelu_forward(n as i32, xs.as_ptr(), ys.as_mut_ptr());
         }
@@ -271,7 +271,7 @@ fn gelu<'py>(
 }
 
 // ============================================================================
-// Softmax — Rust rayon 并行 + 快速近似 exp (Padé [1/1])
+// Softmax — Rust rayon parallel + fast approximate exp (Padé [1/1])
 // ============================================================================
 
 // ============================================================================
@@ -281,8 +281,8 @@ fn gelu<'py>(
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
 
-/// 快速 exp(x) 近似，Padé [1/1]: 2^r ≈ (1+r*A)/(1+r*C), 2^n 用位操作
-/// 纯算术无 libm 调用，编译器可自动向量化
+/// Fast exp(x) approximation, Padé [1/1]: 2^r ≈ (1+r*A)/(1+r*C), 2^n via bit manipulation
+/// Pure arithmetic, no libm calls, compiler can auto-vectorize
 #[inline(always)]
 fn fast_exp(x: f64) -> f64 {
     const INV_LN2: f64 = 1.4426950408889634;
@@ -298,7 +298,7 @@ fn fast_exp(x: f64) -> f64 {
     p * if ni > 1023 { f64::INFINITY } else if ni < -1023 { 0.0 } else { f64::from_bits(((ni + 1023) as u64) << 52) }
 }
 
-/// AVX2 SIMD exp: 4×f64 同时计算
+/// AVX2 SIMD exp: 4×f64 computed simultaneously
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn exp_avx2_4(x: __m256d) -> __m256d {
@@ -445,7 +445,7 @@ fn softmax_fn<'py>(
 }
 
 // ============================================================================
-// Conv2D — 调用 Fortran im2col+GEMM
+// Conv2D — Calls Fortran im2col+GEMM
 // ============================================================================
 
 #[pyfunction]
@@ -475,7 +475,7 @@ fn conv2d<'py>(
     let out_h = (h + 2 * pad - kh) / stride + 1;
     let out_w = (i_w + 2 * pad - kw) / stride + 1;
 
-    // ★ 零拷贝：直接传行主序指针，Fortran 内部用列主序转置恒等式
+    // ★ Zero-copy: pass row-major pointers directly; Fortran uses column-major transpose identity internally
     // img(n,c_in,h,w) row-major = img^T(w,h,c_in,n) column-major
     // weight(c_out,c_in,kh,kw) row-major = weight^T(kw,kh,c_in,c_out) col-major
     // output(n,c_out,out_h,out_w) row-major = output^T(out_w,out_h,c_out,n) col-major
@@ -599,7 +599,7 @@ fn avgpool<'py>(
 }
 
 // ============================================================================
-// LayerNorm — 混合策略：小 batch Rust 2-pass，大 batch Fortran 2-pass SIMD
+// LayerNorm — Hybrid strategy: small batch Rust 2-pass, large batch Fortran 2-pass SIMD
 // ============================================================================
 
 #[pyfunction]
@@ -616,7 +616,7 @@ fn layernorm<'py>(
     let batch = x_arr.shape()[0];
     let dim = x_arr.shape()[1];
 
-    // ★ 大 batch 走 Fortran（OpenMP SIMD），小 batch 走 Rust rayon
+    // ★ Large batch uses Fortran (OpenMP SIMD), small batch uses Rust rayon
     if batch * dim > 8192 {
         let gamma_arr = gamma.map(|g| g.as_array().to_owned()).unwrap_or_else(|| ArrayD::ones(vec![dim]));
         let beta_arr = beta.map(|b| b.as_array().to_owned()).unwrap_or_else(|| ArrayD::zeros(vec![dim]));
@@ -691,7 +691,7 @@ fn cross_entropy<'py>(
     let num_classes = l.shape()[1];
     let batch = l.shape()[0];
 
-    // ★ 零拷贝：logits(batch,classes) 行主序 = logits^T(classes,batch) 列主序
+    // ★ Zero-copy: logits(batch,classes) row-major = logits^T(classes,batch) column-major
     let ls = l.as_slice().unwrap();
     let ts = t.as_slice().unwrap();
     let targets_1b: Vec<i32> = ts.iter().map(|&v| (v + 1) as i32).collect();

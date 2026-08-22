@@ -1,6 +1,6 @@
 !==============================================================================
 ! ForTeX Normalization — BatchNorm & LayerNorm
-! Round-17: AVX-512 SIMD 全覆盖
+! Round-17: AVX-512 SIMD full coverage
 !==============================================================================
 module normalization
     use, intrinsic :: iso_fortran_env, only: real64
@@ -79,11 +79,11 @@ contains
     end subroutine batchnorm2d_forward
 
     !--------------------------------------------------------------------------
-    ! ★ LayerNorm — Round-18: 拆 2 个独立 !$omp parallel do，让 inner SIMD 化
+    ! ★ LayerNorm — Round-18: split into 2 independent !$omp parallel do, enabling inner SIMD
     !
-    ! 根因同 softmax：outer !$omp parallel do 包裹整个函数时，
-    !   gfortran 11.4 抑制 inner !$omp simd reduction → Pass 1 实际串行
-    ! 修复：Pass 1（mean/var）和 Pass 2（normalize）独立 parallel do
+    ! Root cause same as softmax: when outer !$omp parallel do wraps the entire function,
+    !   gfortran 11.4 suppresses inner !$omp simd reduction → Pass 1 is actually serial
+    ! Fix: Pass 1 (mean/var) and Pass 2 (normalize) as independent parallel do
     !--------------------------------------------------------------------------
     subroutine layernorm_forward(batch, dim, x, gamma, beta, eps, y)
         integer, intent(in) :: batch, dim
@@ -105,8 +105,8 @@ contains
         end if
 
         ! ★ Pass 1: per-row sum(x) + sum(x²)
-        ! 关键 OMP 规范：reduction 变量不能再放进 outer private 列表
-        !   （gfortran 11.4 会报 "DECLARE REDUCTION + not found"）
+        ! Key OMP spec: reduction variables must not also be in outer private list
+        !   (gfortran 11.4 reports "DECLARE REDUCTION + not found")
         !$omp parallel do private(b, i) reduction(+:sx, sx2) schedule(static)
         do b = 1, batch
             sx  = 0.0_real64
@@ -121,7 +121,7 @@ contains
         end do
         !$omp end parallel do
 
-        ! 标量预处理
+        ! Scalar preprocessing
         !$omp parallel do private(b, mean_val, var_val, inv_std) schedule(static)
         do b = 1, batch
             mean_val   = sum_x_arr(b)  / dim
@@ -133,8 +133,8 @@ contains
         !$omp end parallel do
 
         ! ★ Pass 2: normalize + gamma + beta
-        ! 注意：直接用融合公式 y = (x - mean) * inv_std * gamma + beta
-        !   不能用中间 private 变量（会破坏 SIMD 向量化）
+        ! Note: use fused formula y = (x - mean) * inv_std * gamma + beta directly
+        !   Cannot use intermediate private variables (would break SIMD vectorization)
         !$omp parallel do private(b, i) schedule(static)
         do b = 1, batch
             !$omp simd
